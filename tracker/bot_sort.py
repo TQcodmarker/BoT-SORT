@@ -7,8 +7,7 @@ from tracker import matching
 from tracker.gmc import GMC
 from tracker.basetrack import BaseTrack, TrackState
 from tracker.kalman_filter import KalmanFilter
-
-from fast_reid.fast_reid_interfece import FastReIDInterface
+from tracker.ais_fusion import AISBuffer, AISFrame, AISFusionConfig
 
 
 class STrack(BaseTrack):
@@ -17,7 +16,7 @@ class STrack(BaseTrack):
     def __init__(self, tlwh, score, feat=None, feat_history=50):
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=float)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
@@ -27,12 +26,20 @@ class STrack(BaseTrack):
 
         self.smooth_feat = None
         self.curr_feat = None
-        if feat is not None:
-            self.update_features(feat)
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
+        self.freeze_feature = False
+        if feat is not None:
+            self.update_features(feat)
+        self.ais_id = None
+        self.last_ais_obs = None
+        self.last_ais_time = None
+        self.ais_reliability = 0.0
+        self.occluded_since = None
 
     def update_features(self, feat):
+        if self.freeze_feature:
+            return
         feat /= np.linalg.norm(feat)
         self.curr_feat = feat
         if self.smooth_feat is None:
@@ -51,14 +58,20 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks):
+    def multi_predict(stracks, ais_obs_by_id=None):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
             for i, st in enumerate(stracks):
-                if st.state != TrackState.Tracked:
+                if st.state != TrackState.Tracked and st.state != TrackState.Occluded:
                     multi_mean[i][6] = 0
                     multi_mean[i][7] = 0
+                obs = None if ais_obs_by_id is None else ais_obs_by_id.get(st.ais_id)
+                if obs is not None:
+                    if obs.vx is not None:
+                        multi_mean[i][4] = obs.vx
+                    if obs.vy is not None:
+                        multi_mean[i][5] = obs.vy
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
@@ -91,6 +104,8 @@ class STrack(BaseTrack):
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
+        self.freeze_feature = False
+        self.occluded_since = None
         if frame_id == 1:
             self.is_activated = True
         self.frame_id = frame_id
@@ -103,11 +118,15 @@ class STrack(BaseTrack):
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
+        self.freeze_feature = False
+        self.occluded_since = None
         self.is_activated = True
         self.frame_id = frame_id
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        if new_track.ais_id is not None:
+            self.bind_ais(new_track.ais_id, new_track.last_ais_obs, frame_id)
 
     def update(self, new_track, frame_id):
         """
@@ -128,9 +147,47 @@ class STrack(BaseTrack):
             self.update_features(new_track.curr_feat)
 
         self.state = TrackState.Tracked
+        self.freeze_feature = False
+        self.occluded_since = None
         self.is_activated = True
 
         self.score = new_track.score
+        if new_track.ais_id is not None:
+            self.bind_ais(new_track.ais_id, new_track.last_ais_obs, frame_id)
+
+    def bind_ais(self, ais_id, obs=None, frame_id=None):
+        self.ais_id = ais_id
+        if obs is not None:
+            self.last_ais_obs = obs
+            self.last_ais_time = obs.timestamp if obs.timestamp is not None else frame_id
+            self.ais_reliability = getattr(obs, 'reliability', 1.0)
+
+    def has_valid_ais(self, config, timestamp=None):
+        return self.last_ais_obs is not None and config.reliability(self.last_ais_obs, timestamp) > 0
+
+    def mark_occluded(self, frame_id):
+        self.state = TrackState.Occluded
+        self.freeze_feature = True
+        if self.occluded_since is None:
+            self.occluded_since = frame_id
+
+    def update_by_ais_virtual(self, obs, config, timestamp=None):
+        if obs is None or self.mean is None or self.kalman_filter is None:
+            return False
+        reliability = config.reliability(obs, timestamp)
+        if reliability <= 0:
+            return False
+
+        measurement = self.mean[:4].copy()
+        measurement[0] = obs.x
+        measurement[1] = obs.y
+        position_var = config.position_variance(obs, timestamp)
+        self.mean, self.covariance = self.kalman_filter.update_virtual(
+            self.mean, self.covariance, measurement,
+            position_var=position_var, scale_var=config.scale_var)
+        self.bind_ais(obs.ais_id, obs, self.frame_id)
+        self.ais_reliability = reliability
+        return True
 
     @property
     def tlwh(self):
@@ -223,11 +280,47 @@ class BoTSORT(object):
         self.appearance_thresh = args.appearance_thresh
 
         if args.with_reid:
+            from fast_reid.fast_reid_interfece import FastReIDInterface
             self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
+        self.ais_config = AISFusionConfig.from_args(args)
+        self.ais_buffer = None
 
-    def update(self, output_results, img):
+    def _ais_observations_for_tracks(self, tracks, current_ais_by_id, timestamp):
+        obs_by_id = dict(current_ais_by_id)
+        for track in tracks:
+            if track.ais_id is None or track.ais_id in obs_by_id:
+                continue
+            obs = track.last_ais_obs
+            if obs is not None and self.ais_config.reliability(obs, timestamp) > 0:
+                obs_by_id[track.ais_id] = obs
+        return obs_by_id
+
+    def _get_ais_frame(self, ais_frame, img, timestamp):
+        if ais_frame is not None:
+            return AISFrame(ais_frame)
+        ais_path = getattr(self.args, 'ais_path', None)
+        camera_para = getattr(self.args, 'camera_para', None)
+        if ais_path is None or camera_para is None or timestamp is None:
+            return AISFrame()
+        if self.ais_buffer is None:
+            image_shape = [img.shape[1], img.shape[0]]
+            self.ais_buffer = AISBuffer(ais_path, camera_para, image_shape)
+        return self.ais_buffer.query(timestamp)
+
+    def _can_mark_occluded(self, track, ais_by_track_id, timestamp):
+        if track.ais_id not in ais_by_track_id:
+            return False
+        obs = ais_by_track_id[track.ais_id]
+        if self.ais_config.reliability(obs, timestamp) < self.ais_config.occlusion_min_score:
+            return False
+        if track.occluded_since is not None:
+            if self.frame_id - track.occluded_since > self.ais_config.occlusion_max_frames:
+                return False
+        return True
+
+    def update(self, output_results, img, ais_frame=None, timestamp=None):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -288,16 +381,27 @@ class BoTSORT(object):
             else:
                 tracked_stracks.append(track)
 
+        ais_frame = self._get_ais_frame(ais_frame, img, timestamp)
+        ais_by_id = ais_frame.by_id()
+
         ''' Step 2: First association, with high score detection boxes'''
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
+        ais_by_track_id = self._ais_observations_for_tracks(strack_pool, ais_by_id, timestamp)
 
         # Predict the current location with KF
-        STrack.multi_predict(strack_pool)
+        STrack.multi_predict(strack_pool, ais_by_track_id)
 
         # Fix camera motion
         warp = self.gmc.apply(img, dets)
+        ais_frame.apply_gmc(warp)
+        ais_by_id = ais_frame.by_id()
+        ais_by_track_id = self._ais_observations_for_tracks(strack_pool, ais_by_id, timestamp)
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
+
+        for track in strack_pool:
+            if track.ais_id in ais_by_track_id:
+                track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
 
         # Associate with high score detection boxes
         ious_dists = matching.iou_distance(strack_pool, detections)
@@ -324,6 +428,10 @@ class BoTSORT(object):
         else:
             dists = ious_dists
 
+        dists = matching.fuse_ais(
+            dists, strack_pool, detections, ais_by_track_id,
+            self.ais_config, timestamp)
+
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
 
         for itracked, idet in matches:
@@ -335,6 +443,10 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+
+        for track in activated_starcks + refind_stracks:
+            if track.ais_id in ais_by_track_id:
+                track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
 
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
@@ -357,8 +469,13 @@ class BoTSORT(object):
         else:
             detections_second = []
 
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        r_tracked_stracks = [strack_pool[i] for i in u_track
+                             if strack_pool[i].state == TrackState.Tracked
+                             or strack_pool[i].state == TrackState.Occluded]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        dists = matching.fuse_ais(
+            dists, r_tracked_stracks, detections_second, ais_by_track_id,
+            self.ais_config, timestamp)
         matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -372,7 +489,10 @@ class BoTSORT(object):
 
         for it in u_track:
             track = r_tracked_stracks[it]
-            if not track.state == TrackState.Lost:
+            if self._can_mark_occluded(track, ais_by_track_id, timestamp):
+                track.mark_occluded(self.frame_id)
+                lost_stracks.append(track)
+            elif not track.state == TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
 
@@ -408,6 +528,10 @@ class BoTSORT(object):
                 continue
 
             track.activate(self.kalman_filter, self.frame_id)
+            obs = ais_frame.nearest(track.to_xywh()[:2], self.ais_config.bind_distance)
+            if obs is not None and obs.ais_id is not None:
+                track.bind_ais(obs.ais_id, obs, self.frame_id)
+                track.update_by_ais_virtual(obs, self.ais_config, timestamp)
             activated_starcks.append(track)
 
         """ Step 5: Update state"""

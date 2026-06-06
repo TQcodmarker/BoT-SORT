@@ -85,7 +85,7 @@ class KalmanFilter(object):
         covariance = np.diag(np.square(std))
         return mean, covariance
 
-    def predict(self, mean, covariance):
+    def predict(self, mean, covariance, motion_mat=None):
         """Run Kalman filter prediction step.
 
         Parameters
@@ -116,13 +116,16 @@ class KalmanFilter(object):
             self._std_weight_velocity * mean[3]]
         motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
 
-        mean = np.dot(mean, self._motion_mat.T)
+        if motion_mat is None:
+            motion_mat = self._motion_mat
+
+        mean = np.dot(mean, motion_mat.T)
         covariance = np.linalg.multi_dot((
-            self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+            motion_mat, covariance, motion_mat.T)) + motion_cov
 
         return mean, covariance
 
-    def project(self, mean, covariance):
+    def project(self, mean, covariance, measurement_cov=None):
         """Project state distribution to measurement space.
 
         Parameters
@@ -139,12 +142,19 @@ class KalmanFilter(object):
             estimate.
 
         """
-        std = [
-            self._std_weight_position * mean[2],
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[2],
-            self._std_weight_position * mean[3]]
-        innovation_cov = np.diag(np.square(std))
+        if measurement_cov is None:
+            std = [
+                self._std_weight_position * mean[2],
+                self._std_weight_position * mean[3],
+                self._std_weight_position * mean[2],
+                self._std_weight_position * mean[3]]
+            innovation_cov = np.diag(np.square(std))
+        else:
+            measurement_cov = np.asarray(measurement_cov, dtype=float)
+            if measurement_cov.ndim == 1:
+                innovation_cov = np.diag(measurement_cov)
+            else:
+                innovation_cov = measurement_cov
 
         mean = np.dot(self._update_mat, mean)
         covariance = np.linalg.multi_dot((
@@ -190,7 +200,7 @@ class KalmanFilter(object):
 
         return mean, covariance
 
-    def update(self, mean, covariance, measurement):
+    def update(self, mean, covariance, measurement, measurement_cov=None):
         """Run Kalman filter correction step.
 
         Parameters
@@ -210,7 +220,7 @@ class KalmanFilter(object):
             Returns the measurement-corrected state distribution.
 
         """
-        projected_mean, projected_cov = self.project(mean, covariance)
+        projected_mean, projected_cov = self.project(mean, covariance, measurement_cov)
 
         chol_factor, lower = scipy.linalg.cho_factor(
             projected_cov, lower=True, check_finite=False)
@@ -223,6 +233,13 @@ class KalmanFilter(object):
         new_covariance = covariance - np.linalg.multi_dot((
             kalman_gain, projected_cov, kalman_gain.T))
         return new_mean, new_covariance
+
+    def update_virtual(self, mean, covariance, measurement, position_var,
+                       scale_var):
+        """Correct state with an AIS virtual observation in xywh space."""
+        measurement_cov = np.asarray(
+            [position_var, position_var, scale_var, scale_var], dtype=float)
+        return self.update(mean, covariance, measurement, measurement_cov)
 
     def gating_distance(self, mean, covariance, measurements,
                         only_position=False, metric='maha'):

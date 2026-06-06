@@ -57,13 +57,13 @@ def ious(atlbrs, btlbrs):
 
     :rtype ious np.ndarray
     """
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float)
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=float)
     if ious.size == 0:
         return ious
 
     ious = bbox_ious(
-        np.ascontiguousarray(atlbrs, dtype=np.float),
-        np.ascontiguousarray(btlbrs, dtype=np.float)
+        np.ascontiguousarray(atlbrs, dtype=float),
+        np.ascontiguousarray(btlbrs, dtype=float)
     )
 
     return ious
@@ -133,14 +133,88 @@ def embedding_distance(tracks, detections, metric='cosine'):
     :return: cost_matrix np.ndarray
     """
 
-    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
     if cost_matrix.size == 0:
         return cost_matrix
-    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float)
-    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float)
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=float)
+    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=float)
 
     cost_matrix = np.maximum(0.0, cdist(track_features, det_features, metric))  # / 2.0  # Nomalized features
     return cost_matrix
+
+
+def ais_projection_distance(tracks, detections, ais_obs_by_id, config, timestamp=None):
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    det_centers = np.asarray([det.to_xywh()[:2] for det in detections], dtype=float)
+    for row, track in enumerate(tracks):
+        obs = None if ais_obs_by_id is None else ais_obs_by_id.get(track.ais_id)
+        if obs is None:
+            cost_matrix[row, :] = 0.0
+            continue
+        reliability = config.reliability(obs, timestamp)
+        if reliability <= 0:
+            cost_matrix[row, :] = 0.0
+            continue
+        dist = np.linalg.norm(det_centers - obs.xy, axis=1)
+        cost_matrix[row, :] = np.clip(dist / max(config.bind_distance, 1.0), 0.0, 1.0)
+    return cost_matrix
+
+
+def ais_heading_distance(tracks, detections, ais_obs_by_id, config, timestamp=None):
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    det_centers = np.asarray([det.to_xywh()[:2] for det in detections], dtype=float)
+    for row, track in enumerate(tracks):
+        obs = None if ais_obs_by_id is None else ais_obs_by_id.get(track.ais_id)
+        if obs is None or obs.vx is None or obs.vy is None:
+            continue
+        reliability = config.reliability(obs, timestamp)
+        ais_vec = np.asarray([obs.vx, obs.vy], dtype=float)
+        ais_norm = np.linalg.norm(ais_vec)
+        if reliability <= 0 or ais_norm < 1e-6:
+            continue
+        ref = track.mean[:2] if track.mean is not None else track.to_xywh()[:2]
+        det_vecs = det_centers - ref
+        det_norms = np.linalg.norm(det_vecs, axis=1)
+        valid = det_norms > 1e-6
+        row_cost = np.zeros(len(detections), dtype=float)
+        if np.any(valid):
+            cos = np.sum(det_vecs[valid] * ais_vec, axis=1) / (det_norms[valid] * ais_norm)
+            row_cost[valid] = (1.0 - np.clip(cos, -1.0, 1.0)) / 2.0
+        cost_matrix[row, :] = row_cost
+    return cost_matrix
+
+
+def fuse_ais(cost_matrix, tracks, detections, ais_obs_by_id, config, timestamp=None):
+    if cost_matrix.size == 0 or config.cost_weight <= 0:
+        return cost_matrix
+    ais_cost = ais_projection_distance(tracks, detections, ais_obs_by_id, config, timestamp)
+    fused = cost_matrix.copy()
+    for row, track in enumerate(tracks):
+        obs = None if ais_obs_by_id is None else ais_obs_by_id.get(track.ais_id)
+        if obs is None:
+            continue
+        reliability = config.reliability(obs, timestamp)
+        if reliability <= 0:
+            continue
+        weight = min(config.cost_weight * reliability, 1.0)
+        fused[row, :] = (1.0 - weight) * cost_matrix[row, :] + weight * ais_cost[row, :]
+    if config.heading_weight > 0:
+        heading_cost = ais_heading_distance(tracks, detections, ais_obs_by_id, config, timestamp)
+        for row, track in enumerate(tracks):
+            obs = None if ais_obs_by_id is None else ais_obs_by_id.get(track.ais_id)
+            if obs is None:
+                continue
+            reliability = config.reliability(obs, timestamp)
+            if reliability <= 0:
+                continue
+            fused[row, :] = fused[row, :] + config.heading_weight * reliability * heading_cost[row, :]
+    return np.clip(fused, 0.0, 1.0)
 
 
 def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):

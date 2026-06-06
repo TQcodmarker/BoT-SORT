@@ -8,6 +8,7 @@ class TrackState(object):
     Lost = 2
     LongLost = 3
     Removed = 4
+    Occluded = 5
 
 
 class BaseTrack(object):
@@ -48,6 +49,9 @@ class BaseTrack(object):
 
     def mark_lost(self):
         self.state = TrackState.Lost
+
+    def mark_occluded(self):
+        self.state = TrackState.Occluded
 
     def mark_long_lost(self):
         self.state = TrackState.LongLost
