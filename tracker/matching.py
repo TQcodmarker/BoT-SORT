@@ -168,7 +168,6 @@ def ais_heading_distance(tracks, detections, ais_obs_by_id, config, timestamp=No
     if cost_matrix.size == 0:
         return cost_matrix
 
-    det_centers = np.asarray([det.to_xywh()[:2] for det in detections], dtype=float)
     for row, track in enumerate(tracks):
         obs = None if ais_obs_by_id is None else ais_obs_by_id.get(track.ais_id)
         if obs is None or obs.vx is None or obs.vy is None:
@@ -176,17 +175,14 @@ def ais_heading_distance(tracks, detections, ais_obs_by_id, config, timestamp=No
         reliability = config.reliability(obs, timestamp)
         ais_vec = np.asarray([obs.vx, obs.vy], dtype=float)
         ais_norm = np.linalg.norm(ais_vec)
-        if reliability <= 0 or ais_norm < 1e-6:
+        if reliability <= 0 or ais_norm < 1e-6 or track.mean is None:
             continue
-        ref = track.mean[:2] if track.mean is not None else track.to_xywh()[:2]
-        det_vecs = det_centers - ref
-        det_norms = np.linalg.norm(det_vecs, axis=1)
-        valid = det_norms > 1e-6
-        row_cost = np.zeros(len(detections), dtype=float)
-        if np.any(valid):
-            cos = np.sum(det_vecs[valid] * ais_vec, axis=1) / (det_norms[valid] * ais_norm)
-            row_cost[valid] = (1.0 - np.clip(cos, -1.0, 1.0)) / 2.0
-        cost_matrix[row, :] = row_cost
+        track_vec = np.asarray([track.mean[4], track.mean[5]], dtype=float)
+        track_norm = np.linalg.norm(track_vec)
+        if track_norm < 1e-6:
+            continue
+        cos = np.dot(track_vec, ais_vec) / (track_norm * ais_norm)
+        cost_matrix[row, :] = (1.0 - np.clip(cos, -1.0, 1.0)) / 2.0
     return cost_matrix
 
 

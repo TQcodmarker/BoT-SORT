@@ -32,6 +32,8 @@ class AISObservation(object):
         self.ais_id = ais_id
         self.x = float(x)
         self.y = float(y)
+        self.raw_x = float(x)
+        self.raw_y = float(y)
         self.timestamp = timestamp
         self.speed = None if speed is None else float(speed)
         self.course = None if course is None else float(course)
@@ -48,11 +50,20 @@ class AISObservation(object):
         return np.asarray([self.x, self.y], dtype=float)
 
     def copy(self):
-        return AISObservation(
+        obs = AISObservation(
             self.ais_id, self.x, self.y, timestamp=self.timestamp,
             speed=self.speed, course=self.course, heading=self.heading,
             vx=self.vx, vy=self.vy, position_var=self.position_var,
             reliability=self.reliability, lon=self.lon, lat=self.lat)
+        obs.raw_x = self.raw_x
+        obs.raw_y = self.raw_y
+        return obs
+
+    def raw_copy(self):
+        obs = self.copy()
+        obs.x = obs.raw_x
+        obs.y = obs.raw_y
+        return obs
 
 
 class AISFrame(object):
@@ -268,7 +279,7 @@ class AISFusionConfig(object):
     def __init__(self, max_age=2.0, kappa=0.5, position_var=4.0,
                  scale_var=1000000.0, bind_distance=120.0, cost_weight=0.25,
                  heading_weight=0.05, occlusion_min_score=0.4,
-                 occlusion_max_frames=60):
+                 occlusion_max_frames=60, cmc_mode='inverse'):
         self.max_age = max_age
         self.kappa = kappa
         self.position_var = position_var
@@ -278,6 +289,7 @@ class AISFusionConfig(object):
         self.heading_weight = heading_weight
         self.occlusion_min_score = occlusion_min_score
         self.occlusion_max_frames = occlusion_max_frames
+        self.cmc_mode = cmc_mode
 
     @classmethod
     def from_args(cls, args):
@@ -290,7 +302,8 @@ class AISFusionConfig(object):
             cost_weight=getattr(args, 'ais_cost_weight', 0.25),
             heading_weight=getattr(args, 'ais_heading_weight', 0.05),
             occlusion_min_score=getattr(args, 'ais_occlusion_min_score', 0.4),
-            occlusion_max_frames=getattr(args, 'ais_occlusion_max_frames', 60))
+            occlusion_max_frames=getattr(args, 'ais_occlusion_max_frames', 60),
+            cmc_mode=getattr(args, 'ais_cmc_mode', 'inverse'))
 
     def delta_t(self, obs, timestamp):
         obs_time = _timestamp_to_seconds(getattr(obs, 'timestamp', None))

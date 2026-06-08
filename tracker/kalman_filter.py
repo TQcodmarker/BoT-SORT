@@ -85,7 +85,7 @@ class KalmanFilter(object):
         covariance = np.diag(np.square(std))
         return mean, covariance
 
-    def predict(self, mean, covariance, motion_mat=None):
+    def predict(self, mean, covariance, motion_mat=None, motion_cov_scale=1.0):
         """Run Kalman filter prediction step.
 
         Parameters
@@ -114,7 +114,7 @@ class KalmanFilter(object):
             self._std_weight_velocity * mean[3],
             self._std_weight_velocity * mean[2],
             self._std_weight_velocity * mean[3]]
-        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel])) * motion_cov_scale
 
         if motion_mat is None:
             motion_mat = self._motion_mat
