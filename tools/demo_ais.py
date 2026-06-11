@@ -31,6 +31,9 @@ from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
 
 
+VIS_COLUMNS = ['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp']
+
+
 def normalize_data_path(path):
     path = path.replace('\\', '/')
     if not path.endswith('/'):
@@ -103,7 +106,9 @@ def targets_to_vis_rows(online_targets, frame_timestamp_ms, args):
     vis_rows = []
 
     for target in online_targets:
-        tlwh = target.tlwh
+        tlwh = np.asarray(target.tlwh, dtype=float)
+        if tlwh.shape[0] < 4 or not np.all(np.isfinite(tlwh[:4])):
+            continue
         if tlwh[2] * tlwh[3] <= args.min_box_area:
             continue
 
@@ -111,6 +116,8 @@ def targets_to_vis_rows(online_targets, frame_timestamp_ms, args):
         y1 = int(max(tlwh[1], 0))
         x2 = int(max(tlwh[0] + tlwh[2], 0))
         y2 = int(max(tlwh[1] + tlwh[3], 0))
+        if x2 <= x1 or y2 <= y1:
+            continue
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
         track_id = int(target.track_id)
@@ -127,16 +134,30 @@ def targets_to_vis_rows(online_targets, frame_timestamp_ms, args):
 
     return pd.DataFrame(
         vis_rows,
-        columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+        columns=VIS_COLUMNS)
+
+
+def sanitize_vis_dataframe(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=VIS_COLUMNS)
+    df = df.reindex(columns=VIS_COLUMNS).copy()
+    for col in VIS_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=VIS_COLUMNS)
+    if len(df) == 0:
+        return pd.DataFrame(columns=VIS_COLUMNS)
+    df = df[np.isfinite(df[VIS_COLUMNS]).all(axis=1)]
+    df = df[(df['x2'] > df['x1']) & (df['y2'] > df['y1'])]
+    return df.astype(int).reset_index(drop=True)
 
 
 class BoTSORTVISAdapter(object):
     """Convert per-frame BoT-SORT outputs to DeepSORVF VISPRO-style seconds."""
 
     def __init__(self):
-        self.Vis_tra = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
-        self.Vis_cur = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
-        self.Vis_tra_cur_frames = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+        self.Vis_tra = pd.DataFrame(columns=VIS_COLUMNS)
+        self.Vis_cur = pd.DataFrame(columns=VIS_COLUMNS)
+        self.Vis_tra_cur_frames = pd.DataFrame(columns=VIS_COLUMNS)
 
     def feed(self, online_targets, timestamp, args, update_second):
         frame_rows = targets_to_vis_rows(online_targets, timestamp, args)
@@ -155,13 +176,11 @@ class BoTSORTVISAdapter(object):
                 row['ID'] = int(track_id)
                 row['timestamp'] = int(timestamp // 1000)
                 cur_rows.append(row)
-            self.Vis_cur = pd.DataFrame(
-                cur_rows,
-                columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
-            self.Vis_tra_cur_frames = pd.DataFrame(
-                columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+            self.Vis_cur = sanitize_vis_dataframe(pd.DataFrame(cur_rows, columns=VIS_COLUMNS))
+            self.Vis_tra_cur_frames = pd.DataFrame(columns=VIS_COLUMNS)
             if len(self.Vis_cur) > 0:
                 self.Vis_tra = pd.concat([self.Vis_tra, self.Vis_cur], ignore_index=True)
+                self.Vis_tra = sanitize_vis_dataframe(self.Vis_tra)
                 self.Vis_tra = self.Vis_tra.drop(
                     self.Vis_tra[self.Vis_tra['timestamp'] < (timestamp // 1000 - 2 * 60)].index)
 
@@ -363,6 +382,7 @@ def run(args):
         end = time.time() - start
         time_i += end
         if timestamp % 1000 < frame_step_ms:
+            Vis_cur = sanitize_vis_dataframe(Vis_cur)
             gen_result(times, Vis_cur, Fus_tra, result_metric, im_shape)
             times += 1
             sum_t.append(time_i)
