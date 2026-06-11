@@ -44,7 +44,7 @@ def resize_by_height(img, height):
     return cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
-def timestamp_to_ms(value):
+def timestamp_to_tracker_ms(value):
     if value is None:
         return None
     try:
@@ -56,6 +56,20 @@ def timestamp_to_ms(value):
     if value > 10000000000:
         return value
     return value * 1000.0
+
+
+def timestamp_to_deepsorvf_sec(value):
+    if value is None:
+        return 0
+    try:
+        if pd.isna(value):
+            return 0
+    except TypeError:
+        pass
+    value = float(value)
+    if value > 10000000000:
+        value /= 1000.0
+    return int(value)
 
 
 def get_value(source, name, default=None):
@@ -75,7 +89,18 @@ def get_value(source, name, default=None):
     return value
 
 
-def ais_vis_to_records(AIS_vis):
+def current_ais_vis(AIS_vis, frame_timestamp_ms):
+    if AIS_vis is None or len(AIS_vis) == 0:
+        return pd.DataFrame(columns=[
+            'mmsi', 'lon', 'lat', 'speed', 'course', 'heading',
+            'type', 'x', 'y', 'timestamp'
+        ])
+    frame_sec = int(frame_timestamp_ms // 1000)
+    timestamps = AIS_vis['timestamp'].astype(float).astype(int)
+    return AIS_vis[timestamps == frame_sec].reset_index(drop=True)
+
+
+def ais_vis_to_records(AIS_vis, frame_timestamp_ms):
     records = []
     if AIS_vis is None or len(AIS_vis) == 0:
         return records
@@ -83,9 +108,10 @@ def ais_vis_to_records(AIS_vis):
     for _, row in AIS_vis.iterrows():
         if pd.isna(row.get('mmsi')) or pd.isna(row.get('x')) or pd.isna(row.get('y')):
             continue
-        ais_timestamp = timestamp_to_ms(row.get('timestamp'))
+        ais_timestamp = timestamp_to_tracker_ms(row.get('timestamp'))
         if ais_timestamp is None:
             continue
+        delta_t = abs(frame_timestamp_ms - ais_timestamp) / 1000.0
         records.append({
             'ais_id': int(row['mmsi']),
             'x': float(row['x']),
@@ -96,6 +122,8 @@ def ais_vis_to_records(AIS_vis):
             'heading': row.get('heading', None),
             'lon': row.get('lon', None),
             'lat': row.get('lat', None),
+            'reliability': 1.0,
+            'delta_t': delta_t,
         })
     return records
 
@@ -186,7 +214,7 @@ def targets_to_deepsorvf_frames(online_targets, AIS_vis, frame_timestamp_ms, arg
             'y1': y1,
             'w': int(tlwh[2]),
             'h': int(tlwh[3]),
-            'timestamp': int(timestamp_to_ms(ais['timestamp']) or frame_timestamp_ms),
+            'timestamp': timestamp_to_deepsorvf_sec(ais['timestamp']),
         })
 
     Vis_cur = pd.DataFrame(
@@ -233,6 +261,12 @@ class Predictor(object):
 
 
 def build_predictor(args):
+    if args.with_reid:
+        if not osp.isabs(args.fast_reid_config):
+            args.fast_reid_config = osp.join(BOT_SORT_ROOT, args.fast_reid_config)
+        if not osp.isabs(args.fast_reid_weights):
+            args.fast_reid_weights = osp.join(BOT_SORT_ROOT, args.fast_reid_weights)
+
     exp = get_exp(args.exp_file, args.name)
     if args.conf is not None:
         exp.test_conf = args.conf
@@ -261,6 +295,28 @@ def build_predictor(args):
     return Predictor(model, exp, device, args.fp16)
 
 
+def update_tracker(tracker, detections, img, ais_frame, timestamp, use_ais):
+    if use_ais:
+        return tracker.update(detections, img, ais_frame=ais_frame, timestamp=timestamp)
+
+    config = tracker.ais_config
+    old_max_age = config.max_age
+    old_cost_weight = config.cost_weight
+    old_heading_weight = config.heading_weight
+    old_occlusion_min_score = config.occlusion_min_score
+    try:
+        config.max_age = -1.0
+        config.cost_weight = 0.0
+        config.heading_weight = 0.0
+        config.occlusion_min_score = float('inf')
+        return tracker.update(detections, img, ais_frame=[], timestamp=timestamp)
+    finally:
+        config.max_age = old_max_age
+        config.cost_weight = old_cost_weight
+        config.heading_weight = old_heading_weight
+        config.occlusion_min_score = old_occlusion_min_score
+
+
 def run(args):
     args.mot20 = not args.fuse_score
     args.data_path = normalize_data_path(args.data_path)
@@ -268,6 +324,10 @@ def run(args):
     video_path, ais_path, result_video, result_metric, initial_time, camera_para = read_all(
         args.data_path, args.result_path)
     if args.path:
+        if osp.basename(osp.normpath(args.path)) != osp.basename(osp.normpath(video_path)):
+            raise ValueError(
+                '--path must point to the same clip video as --data_path so AIS time stays aligned. '
+                'Use --data_path for the target clip directory.')
         video_path = args.path
 
     ais_file, timestamp0, time0 = ais_initial(ais_path, initial_time)
@@ -307,8 +367,10 @@ def run(args):
         start = time.time()
 
         Time, timestamp, Time_name = update_time(Time, frame_step_ms)
+        ais_update_frame = timestamp % 1000 < frame_step_ms
         AIS_vis, AIS_cur = AIS.process(camera_para, timestamp, Time_name)
-        ais_frame = ais_vis_to_records(AIS_vis)
+        AIS_vis_current = current_ais_vis(AIS_vis, timestamp) if ais_update_frame else current_ais_vis(None, timestamp)
+        ais_frame = ais_vis_to_records(AIS_vis_current, timestamp)
 
         outputs, img_info = predictor.inference(im, timer)
         scale = min(
@@ -321,11 +383,11 @@ def run(args):
         else:
             detections = np.empty((0, 7), dtype=float)
 
-        online_targets = tracker.update(
-            detections, img_info['raw_img'], ais_frame=ais_frame, timestamp=timestamp)
+        online_targets = update_tracker(
+            tracker, detections, img_info['raw_img'], ais_frame, timestamp, ais_update_frame)
         timer.toc()
 
-        Vis_cur, Fus_tra = targets_to_deepsorvf_frames(online_targets, AIS_vis, timestamp, args)
+        Vis_cur, Fus_tra = targets_to_deepsorvf_frames(online_targets, AIS_vis_current, timestamp, args)
         if len(Vis_cur) > 0:
             Vis_tra = pd.concat([Vis_tra, Vis_cur], ignore_index=True)
             Vis_tra = Vis_tra.drop(
@@ -343,7 +405,7 @@ def run(args):
 
         result = DRA.draw_traj(im, AIS_vis, AIS_cur, Vis_tra, Vis_cur, Fus_tra, timestamp)
         result = resize_by_height(result, args.show_size)
-        if writer is None:
+        if args.save_result and writer is None:
             fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
             writer = cv2.VideoWriter(result_video, fourcc, fps, (result.shape[1], result.shape[0]))
         if args.save_result:
