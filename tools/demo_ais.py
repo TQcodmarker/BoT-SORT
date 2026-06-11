@@ -7,7 +7,6 @@ import cv2
 import imutils
 import numpy as np
 import pandas as pd
-import torch
 
 
 BOT_SORT_ROOT = osp.abspath(osp.join(osp.dirname(__file__), '..'))
@@ -24,9 +23,6 @@ from utils.FUS_utils import FUSPRO
 from utils.gen_result import gen_result
 from utils.draw import DRAW
 from utils.file_read import ais_initial, read_all, update_time
-from yolox.data.data_augment import preproc
-from yolox.exp import get_exp
-from yolox.utils import fuse_model, get_model_info, postprocess
 
 
 def normalize_data_path(path):
@@ -34,71 +30,6 @@ def normalize_data_path(path):
     if not path.endswith('/'):
         path += '/'
     return path
-
-
-class Predictor(object):
-    def __init__(self, model, exp, device, fp16=False):
-        self.model = model
-        self.num_classes = exp.num_classes
-        self.confthre = exp.test_conf
-        self.nmsthre = exp.nmsthre
-        self.test_size = exp.test_size
-        self.device = device
-        self.fp16 = fp16
-        self.rgb_means = (0.485, 0.456, 0.406)
-        self.std = (0.229, 0.224, 0.225)
-
-    def inference(self, img):
-        img_info = {
-            'height': img.shape[0],
-            'width': img.shape[1],
-            'raw_img': img,
-        }
-        proc_img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
-        img_info['ratio'] = ratio
-        proc_img = torch.from_numpy(proc_img).unsqueeze(0).float().to(self.device)
-        if self.fp16:
-            proc_img = proc_img.half()
-
-        with torch.no_grad():
-            outputs = self.model(proc_img)
-            outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
-        return outputs, img_info
-
-
-def build_predictor(args):
-    if args.with_reid:
-        if not osp.isabs(args.fast_reid_config):
-            args.fast_reid_config = osp.join(BOT_SORT_ROOT, args.fast_reid_config)
-        if not osp.isabs(args.fast_reid_weights):
-            args.fast_reid_weights = osp.join(BOT_SORT_ROOT, args.fast_reid_weights)
-
-    exp = get_exp(args.exp_file, args.name)
-    if args.conf is not None:
-        exp.test_conf = args.conf
-    if args.nms is not None:
-        exp.nmsthre = args.nms
-    if args.tsize is not None:
-        exp.test_size = (args.tsize, args.tsize)
-
-    device = torch.device('cuda' if args.device == 'gpu' and torch.cuda.is_available() else 'cpu')
-    model = exp.get_model().to(device)
-    print('Model Summary: {}'.format(get_model_info(model, exp.test_size)))
-    model.eval()
-
-    if args.ckpt is None:
-        raise ValueError('Please pass --ckpt for the YOLOX detector checkpoint.')
-    print('loading checkpoint')
-    ckpt = torch.load(args.ckpt, map_location='cpu')
-    model.load_state_dict(ckpt.get('model', ckpt))
-    print('loaded checkpoint done.')
-
-    if args.fuse:
-        print('Fusing model...')
-        model = fuse_model(model)
-    if args.fp16:
-        model = model.half()
-    return Predictor(model, exp, device, args.fp16)
 
 
 def main(arg):
@@ -131,9 +62,8 @@ def main(arg):
     FUS = FUSPRO(max_dis, im_shape, t)
     DRA = DRAW(im_shape, t)
 
-    predictor = build_predictor(arg)
     tracker = BoTSORT(arg, frame_rate=fps)
-    VIS = VISPRO(predictor, tracker, arg.anti, arg.anti_rate, t)
+    VIS = VISPRO(tracker, arg.anti, arg.anti_rate, t)
 
     name = 'demo'
     show_size = 500
@@ -200,16 +130,9 @@ def make_parser():
     parser.add_argument('--data_path', type=str, default='./clip-01/', help='data path')
     parser.add_argument('--result_path', type=str, default='./result/', help='result path')
 
-    parser.add_argument('-f', '--exp_file', default=None, type=str)
-    parser.add_argument('-c', '--ckpt', default=None, type=str)
     parser.add_argument('-n', '--name', default=None, type=str)
     parser.add_argument('--device', default='gpu', choices=['gpu', 'cpu'])
-    parser.add_argument('--conf', default=None, type=float)
-    parser.add_argument('--nms', default=None, type=float)
-    parser.add_argument('--tsize', default=None, type=int)
     parser.add_argument('--fps', default=30, type=int)
-    parser.add_argument('--fp16', action='store_true')
-    parser.add_argument('--fuse', action='store_true')
 
     parser.add_argument('--track_high_thresh', type=float, default=0.6)
     parser.add_argument('--track_low_thresh', default=0.1, type=float)
