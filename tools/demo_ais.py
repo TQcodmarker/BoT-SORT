@@ -1,14 +1,13 @@
 import argparse
-import os
 import os.path as osp
 import sys
 import time
 
 import cv2
+import imutils
 import numpy as np
 import pandas as pd
 import torch
-from loguru import logger
 
 
 BOT_SORT_ROOT = osp.abspath(osp.join(osp.dirname(__file__), '..'))
@@ -19,19 +18,15 @@ if DEEPSORVF_ROOT not in sys.path:
     sys.path.insert(0, DEEPSORVF_ROOT)
 
 from tracker.bot_sort import BoTSORT
-from tracker.ais_fusion import AISFrame
-from tracker.tracking_utils.timer import Timer
 from utils.AIS_utils import AISPRO
-from utils.draw import DRAW
-from utils.file_read import ais_initial, read_all, update_time
+from utils.VIS_utils_botsort import VISPRO
 from utils.FUS_utils import FUSPRO
 from utils.gen_result import gen_result
+from utils.draw import DRAW
+from utils.file_read import ais_initial, read_all, update_time
 from yolox.data.data_augment import preproc
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
-
-
-VIS_COLUMNS = ['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp']
 
 
 def normalize_data_path(path):
@@ -39,182 +34,6 @@ def normalize_data_path(path):
     if not path.endswith('/'):
         path += '/'
     return path
-
-
-def resize_by_height(img, height):
-    if height <= 0 or img.shape[0] == height:
-        return img
-    scale = float(height) / float(img.shape[0])
-    width = int(round(img.shape[1] * scale))
-    return cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
-
-
-def timestamp_to_tracker_ms(value):
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except TypeError:
-        pass
-    value = float(value)
-    if value > 10000000000:
-        return value
-    return value * 1000.0
-
-
-def current_ais_vis(AIS_vis, frame_timestamp_ms):
-    if AIS_vis is None or len(AIS_vis) == 0:
-        return pd.DataFrame(columns=[
-            'mmsi', 'lon', 'lat', 'speed', 'course', 'heading',
-            'type', 'x', 'y', 'timestamp'
-        ])
-    frame_sec = int(frame_timestamp_ms // 1000)
-    timestamps = AIS_vis['timestamp'].astype(float).astype(int)
-    return AIS_vis[timestamps == frame_sec].reset_index(drop=True)
-
-
-def ais_vis_to_records(AIS_vis, frame_timestamp_ms):
-    records = []
-    if AIS_vis is None or len(AIS_vis) == 0:
-        return records
-
-    for _, row in AIS_vis.iterrows():
-        if pd.isna(row.get('mmsi')) or pd.isna(row.get('x')) or pd.isna(row.get('y')):
-            continue
-        ais_timestamp = timestamp_to_tracker_ms(row.get('timestamp'))
-        if ais_timestamp is None:
-            continue
-        delta_t = abs(frame_timestamp_ms - ais_timestamp) / 1000.0
-        records.append({
-            'ais_id': int(row['mmsi']),
-            'x': float(row['x']),
-            'y': float(row['y']),
-            'timestamp': ais_timestamp,
-            'speed': row.get('speed', None),
-            'course': row.get('course', None),
-            'heading': row.get('heading', None),
-            'lon': row.get('lon', None),
-            'lat': row.get('lat', None),
-            'reliability': 1.0,
-            'delta_t': delta_t,
-        })
-    return records
-
-
-def targets_to_vis_rows(online_targets, frame_timestamp_ms, args):
-    vis_rows = []
-
-    for target in online_targets:
-        tlwh = np.asarray(target.tlwh, dtype=float)
-        if tlwh.shape[0] < 4 or not np.all(np.isfinite(tlwh[:4])):
-            continue
-        if tlwh[2] * tlwh[3] <= args.min_box_area:
-            continue
-
-        x1 = int(max(tlwh[0], 0))
-        y1 = int(max(tlwh[1], 0))
-        x2 = int(max(tlwh[0] + tlwh[2], 0))
-        y2 = int(max(tlwh[1] + tlwh[3], 0))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-        track_id = int(target.track_id)
-        vis_rows.append({
-            'ID': track_id,
-            'x1': x1,
-            'y1': y1,
-            'x2': x2,
-            'y2': y2,
-            'x': cx,
-            'y': cy,
-            'timestamp': int(frame_timestamp_ms // 1000),
-        })
-
-    return pd.DataFrame(
-        vis_rows,
-        columns=VIS_COLUMNS)
-
-
-def sanitize_vis_dataframe(df):
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=VIS_COLUMNS)
-    df = df.reindex(columns=VIS_COLUMNS).copy()
-    for col in VIS_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df = df.dropna(subset=VIS_COLUMNS)
-    if len(df) == 0:
-        return pd.DataFrame(columns=VIS_COLUMNS)
-    df = df[np.isfinite(df[VIS_COLUMNS]).all(axis=1)]
-    df = df[(df['x2'] > df['x1']) & (df['y2'] > df['y1'])]
-    return df.astype(int).reset_index(drop=True)
-
-
-class BoTSORTVISAdapter(object):
-    """Convert per-frame BoT-SORT outputs to DeepSORVF VISPRO-style seconds."""
-
-    def __init__(self):
-        self.Vis_tra = pd.DataFrame(columns=VIS_COLUMNS)
-        self.Vis_cur = pd.DataFrame(columns=VIS_COLUMNS)
-        self.Vis_tra_cur_frames = pd.DataFrame(columns=VIS_COLUMNS)
-
-    def feed(self, online_targets, timestamp, args, update_second):
-        frame_rows = targets_to_vis_rows(online_targets, timestamp, args)
-        if len(frame_rows) > 0:
-            self.Vis_tra_cur_frames = pd.concat(
-                [self.Vis_tra_cur_frames, frame_rows], ignore_index=True)
-
-        if update_second:
-            cur_rows = []
-            for track_id in self.Vis_tra_cur_frames['ID'].unique():
-                rows = self.Vis_tra_cur_frames[
-                    self.Vis_tra_cur_frames['ID'] == track_id].reset_index(drop=True)
-                if len(rows) == 0:
-                    continue
-                row = rows.mean(numeric_only=True).astype(int)
-                row['ID'] = int(track_id)
-                row['timestamp'] = int(timestamp // 1000)
-                cur_rows.append(row)
-            self.Vis_cur = sanitize_vis_dataframe(pd.DataFrame(cur_rows, columns=VIS_COLUMNS))
-            self.Vis_tra_cur_frames = pd.DataFrame(columns=VIS_COLUMNS)
-            if len(self.Vis_cur) > 0:
-                self.Vis_tra = pd.concat([self.Vis_tra, self.Vis_cur], ignore_index=True)
-                self.Vis_tra = sanitize_vis_dataframe(self.Vis_tra)
-                self.Vis_tra = self.Vis_tra.drop(
-                    self.Vis_tra[self.Vis_tra['timestamp'] < (timestamp // 1000 - 2 * 60)].index)
-
-        return self.Vis_tra, self.Vis_cur
-
-
-def fusion_bindings(Fus_tra):
-    bindings = {}
-    if Fus_tra is None or len(Fus_tra) == 0:
-        return bindings
-    for _, row in Fus_tra.iterrows():
-        try:
-            bindings[int(row['ID'])] = int(row['mmsi'])
-        except (TypeError, ValueError):
-            continue
-    return bindings
-
-
-def apply_fusion_binding_to_tracks(online_targets, Fus_tra, ais_records, tracker,
-                                   timestamp, state_update=False):
-    bindings = fusion_bindings(Fus_tra)
-    if len(bindings) == 0:
-        return
-
-    ais_by_id = AISFrame(ais_records).by_id()
-    for target in online_targets:
-        track_id = int(target.track_id)
-        if track_id not in bindings:
-            continue
-        mmsi = bindings[track_id]
-        obs = ais_by_id.get(mmsi)
-        target.bind_ais(mmsi, obs, tracker.frame_id)
-        if state_update and obs is not None:
-            target.update_by_ais_virtual(obs, tracker.ais_config, timestamp)
 
 
 class Predictor(object):
@@ -229,7 +48,7 @@ class Predictor(object):
         self.rgb_means = (0.485, 0.456, 0.406)
         self.std = (0.229, 0.224, 0.225)
 
-    def inference(self, img, timer):
+    def inference(self, img):
         img_info = {
             'height': img.shape[0],
             'width': img.shape[1],
@@ -242,7 +61,6 @@ class Predictor(object):
             proc_img = proc_img.half()
 
         with torch.no_grad():
-            timer.tic()
             outputs = self.model(proc_img)
             outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
         return outputs, img_info
@@ -265,168 +83,122 @@ def build_predictor(args):
 
     device = torch.device('cuda' if args.device == 'gpu' and torch.cuda.is_available() else 'cpu')
     model = exp.get_model().to(device)
-    logger.info('Model Summary: {}'.format(get_model_info(model, exp.test_size)))
+    print('Model Summary: {}'.format(get_model_info(model, exp.test_size)))
     model.eval()
 
     if args.ckpt is None:
         raise ValueError('Please pass --ckpt for the YOLOX detector checkpoint.')
-    logger.info('loading checkpoint')
+    print('loading checkpoint')
     ckpt = torch.load(args.ckpt, map_location='cpu')
     model.load_state_dict(ckpt.get('model', ckpt))
-    logger.info('loaded checkpoint done.')
+    print('loaded checkpoint done.')
 
     if args.fuse:
-        logger.info('Fusing model...')
+        print('Fusing model...')
         model = fuse_model(model)
     if args.fp16:
         model = model.half()
     return Predictor(model, exp, device, args.fp16)
 
 
-def update_tracker_without_ais(tracker, detections, img, timestamp):
-    config = tracker.ais_config
-    old_max_age = config.max_age
-    old_cost_weight = config.cost_weight
-    old_heading_weight = config.heading_weight
-    old_occlusion_min_score = config.occlusion_min_score
-    try:
-        config.max_age = -1.0
-        config.cost_weight = 0.0
-        config.heading_weight = 0.0
-        config.occlusion_min_score = float('inf')
-        return tracker.update(detections, img, ais_frame=[], timestamp=timestamp)
-    finally:
-        config.max_age = old_max_age
-        config.cost_weight = old_cost_weight
-        config.heading_weight = old_heading_weight
-        config.occlusion_min_score = old_occlusion_min_score
-
-
-def run(args):
-    args.mot20 = not args.fuse_score
-    args.data_path = normalize_data_path(args.data_path)
-    args.result_path = normalize_data_path(args.result_path)
+def main(arg):
+    arg.data_path = normalize_data_path(arg.data_path)
+    arg.result_path = normalize_data_path(arg.result_path)
     video_path, ais_path, result_video, result_metric, initial_time, camera_para = read_all(
-        args.data_path, args.result_path)
-    if args.path:
-        if osp.basename(osp.normpath(args.path)) != osp.basename(osp.normpath(video_path)):
-            raise ValueError(
-                '--path must point to the same clip video as --data_path so AIS time stays aligned. '
-                'Use --data_path for the target clip directory.')
-        video_path = args.path
+        arg.data_path, arg.result_path)
 
-    ais_file, timestamp0, time0 = ais_initial(ais_path, initial_time)
-    Time = initial_time.copy()
+    arg.video_path = video_path
+    arg.ais_path = ais_path
+    arg.result_video = result_video
+    arg.result_metric = result_metric
+    arg.initial_time = initial_time
+    arg.camera_para = camera_para
+    arg.mot20 = not arg.fuse_score
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError('Unable to open video: {}'.format(video_path))
+    ais_file, timestamp0, time0 = ais_initial(arg.ais_path, arg.initial_time)
+    Time = arg.initial_time.copy()
 
-    im_shape = [cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)]
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    cap = cv2.VideoCapture(arg.video_path)
+    im_shape = [cap.get(3), cap.get(4)]
+    max_dis = min(im_shape) // 2
+    fps = int(cap.get(5))
     if fps <= 0:
-        fps = args.fps
-    args.fps = fps
-    frame_step_ms = int(1000 / fps)
+        fps = arg.fps
+    arg.fps = fps
+    t = int(1000 / fps)
 
-    AIS = AISPRO(ais_path, ais_file, im_shape, frame_step_ms)
-    FUS = FUSPRO(min(im_shape) // 2, im_shape, frame_step_ms)
-    DRA = DRAW(im_shape, frame_step_ms)
-    predictor = build_predictor(args)
-    tracker = BoTSORT(args, frame_rate=fps)
-    timer = Timer()
+    AIS = AISPRO(arg.ais_path, ais_file, im_shape, t)
+    FUS = FUSPRO(max_dis, im_shape, t)
+    DRA = DRAW(im_shape, t)
 
-    os.makedirs(osp.dirname(result_video), exist_ok=True)
-    writer = None
-    VIS = BoTSORTVISAdapter()
+    predictor = build_predictor(arg)
+    tracker = BoTSORT(arg, frame_rate=fps)
+    VIS = VISPRO(predictor, tracker, arg.anti, arg.anti_rate, t)
+
+    name = 'demo'
+    show_size = 500
+    videoWriter = None
     bin_inf = pd.DataFrame(columns=['ID', 'mmsi', 'timestamp', 'match'])
+
+    print('Start Time: %s || Stamp: %d || fps: %d' % (time0, timestamp0, fps))
     times = 0
-    frame_id = 0
-    time_i = 0.0
+    time_i = 0
     sum_t = []
 
-    logger.info('Start Time: {} || Stamp: {} || fps: {}'.format(time0, timestamp0, fps))
     while True:
-        ok, im = cap.read()
-        if not ok or im is None:
+        _, im = cap.read()
+        if im is None:
             break
-        frame_id += 1
         start = time.time()
 
-        Time, timestamp, Time_name = update_time(Time, frame_step_ms)
-        ais_update_frame = timestamp % 1000 < frame_step_ms
+        Time, timestamp, Time_name = update_time(Time, t)
+
         AIS_vis, AIS_cur = AIS.process(camera_para, timestamp, Time_name)
-        AIS_vis_current = current_ais_vis(AIS_vis, timestamp) if ais_update_frame else current_ais_vis(None, timestamp)
-        ais_frame = ais_vis_to_records(AIS_vis_current, timestamp)
 
-        outputs, img_info = predictor.inference(im, timer)
-        scale = min(
-            predictor.test_size[0] / float(img_info['height']),
-            predictor.test_size[1] / float(img_info['width']))
+        Vis_tra, Vis_cur = VIS.feedCap(im, timestamp, AIS_vis, bin_inf)
 
-        if outputs[0] is not None:
-            detections = outputs[0].cpu().numpy()[:, :7]
-            detections[:, :4] /= scale
-        else:
-            detections = np.empty((0, 7), dtype=float)
-
-        online_targets = update_tracker_without_ais(
-            tracker, detections, img_info['raw_img'], timestamp)
-        timer.toc()
-
-        Vis_tra, Vis_cur = VIS.feed(online_targets, timestamp, args, ais_update_frame)
         Fus_tra, bin_inf = FUS.fusion(AIS_vis, AIS_cur, Vis_tra, Vis_cur, timestamp)
-        apply_fusion_binding_to_tracks(
-            online_targets, Fus_tra, ais_frame, tracker, timestamp, args.ais_state_update)
 
         end = time.time() - start
-        time_i += end
-        if timestamp % 1000 < frame_step_ms:
-            Vis_cur = sanitize_vis_dataframe(Vis_cur)
-            gen_result(times, Vis_cur, Fus_tra, result_metric, im_shape)
-            times += 1
+        time_i = time_i + end
+        if timestamp % 1000 < t:
+            gen_result(times, Vis_cur, Fus_tra, arg.result_metric, im_shape)
+            times = times + 1
             sum_t.append(time_i)
-            logger.info('Time: {} || Stamp: {} || Process: {:.6f} || Average: {:.6f} +- {:.6f}'.format(
-                Time_name, timestamp, time_i, np.mean(sum_t), np.std(sum_t)))
-            time_i = 0.0
+            print('Time: %s || Stamp: %d || Process: %.6f || Average: %.6f +- %.6f' %
+                  (Time_name, timestamp, time_i, np.mean(sum_t), np.std(sum_t)))
+            time_i = 0
 
-        result = DRA.draw_traj(im, AIS_vis, AIS_cur, Vis_tra, Vis_cur, Fus_tra, timestamp)
-        result = resize_by_height(result, args.show_size)
-        if args.save_result and writer is None:
+        im = DRA.draw_traj(im, AIS_vis, AIS_cur, Vis_tra, Vis_cur, Fus_tra, timestamp)
+
+        result = im
+        result = imutils.resize(result, height=show_size)
+        if videoWriter is None:
             fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
-            writer = cv2.VideoWriter(result_video, fourcc, fps, (result.shape[1], result.shape[0]))
-        if args.save_result:
-            writer.write(result)
+            videoWriter = cv2.VideoWriter(
+                arg.result_video, fourcc, fps, (result.shape[1], result.shape[0]))
 
-        if args.show:
-            cv2.imshow('BoT-SORT AIS', result)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        videoWriter.write(result)
 
-        if args.max_frames > 0 and frame_id >= args.max_frames:
+        cv2.imshow(name, result)
+        cv2.waitKey(1)
+        if cv2.getWindowProperty(name, cv2.WND_PROP_AUTOSIZE) < 1:
             break
 
     cap.release()
-    if writer is not None:
-        writer.release()
-    if args.show:
-        cv2.destroyAllWindows()
-
-    logger.info('Saved metric prefix: {}'.format(result_metric))
-    if args.save_result:
-        logger.info('Saved video: {}'.format(result_video))
+    if videoWriter is not None:
+        videoWriter.release()
+    cv2.destroyAllWindows()
 
 
 def make_parser():
-    parser = argparse.ArgumentParser('BoT-SORT AIS Demo with DeepSORVF-style output')
-    parser.add_argument('demo', default='video', choices=['video'], help='demo type')
-    parser.add_argument('--path', default='', help='optional video path override')
-    parser.add_argument('--data_path', type=str, default='../clip-01/', help='DeepSORVF clip directory')
-    parser.add_argument('--result_path', type=str, default='../result_ais/', help='DeepSORVF-style result directory')
-    parser.add_argument('--save_result', action='store_true', help='save rendered video')
-    parser.add_argument('--show', action='store_true', help='show rendered video')
-    parser.add_argument('--show_size', type=int, default=500)
-    parser.add_argument('--max_frames', type=int, default=-1)
+    parser = argparse.ArgumentParser(description='DeepSORVF with YOLOX + BoT-SORT VISPRO')
+
+    parser.add_argument('--anti', type=int, default=1, help='anti-occlusion True/1|False/0')
+    parser.add_argument('--anti_rate', type=int, default=0, help='occlusion rate 0-1')
+
+    parser.add_argument('--data_path', type=str, default='./clip-01/', help='data path')
+    parser.add_argument('--result_path', type=str, default='./result/', help='result path')
 
     parser.add_argument('-f', '--exp_file', default=None, type=str)
     parser.add_argument('-c', '--ckpt', default=None, type=str)
@@ -468,12 +240,16 @@ def make_parser():
     parser.add_argument('--ais-occlusion-max-frames', dest='ais_occlusion_max_frames', type=int, default=60)
     parser.add_argument('--ais-cmc-mode', dest='ais_cmc_mode',
                         choices=['none', 'same', 'inverse'], default='inverse')
-    parser.add_argument('--ais-state-update', dest='ais_state_update',
-                        default=False, action='store_true',
-                        help='after FUSPRO binding, correct bound BoT-SORT states with current AIS')
     parser.set_defaults(ablation=False, mot20=False, oar_polygon=None)
     return parser
 
 
 if __name__ == '__main__':
-    run(make_parser().parse_args())
+    argspar = make_parser().parse_args()
+
+    print('\nVesselSORT')
+    for p, v in zip(argspar.__dict__.keys(), argspar.__dict__.values()):
+        print('\t{}: {}'.format(p, v))
+    print('\n')
+
+    main(argspar)
