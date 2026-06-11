@@ -99,13 +99,12 @@ def ais_vis_to_records(AIS_vis, frame_timestamp_ms):
     return records
 
 
-def targets_to_vis_cur(online_targets, frame_timestamp_ms, args):
+def targets_to_vis_rows(online_targets, frame_timestamp_ms, args):
     vis_rows = []
 
     for target in online_targets:
         tlwh = target.tlwh
-        vertical = tlwh[2] / max(tlwh[3], 1e-6) > args.aspect_ratio_thresh
-        if tlwh[2] * tlwh[3] <= args.min_box_area or vertical:
+        if tlwh[2] * tlwh[3] <= args.min_box_area:
             continue
 
         x1 = int(max(tlwh[0], 0))
@@ -129,6 +128,44 @@ def targets_to_vis_cur(online_targets, frame_timestamp_ms, args):
     return pd.DataFrame(
         vis_rows,
         columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+
+
+class BoTSORTVISAdapter(object):
+    """Convert per-frame BoT-SORT outputs to DeepSORVF VISPRO-style seconds."""
+
+    def __init__(self):
+        self.Vis_tra = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+        self.Vis_cur = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+        self.Vis_tra_cur_frames = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+
+    def feed(self, online_targets, timestamp, args, update_second):
+        frame_rows = targets_to_vis_rows(online_targets, timestamp, args)
+        if len(frame_rows) > 0:
+            self.Vis_tra_cur_frames = pd.concat(
+                [self.Vis_tra_cur_frames, frame_rows], ignore_index=True)
+
+        if update_second:
+            cur_rows = []
+            for track_id in self.Vis_tra_cur_frames['ID'].unique():
+                rows = self.Vis_tra_cur_frames[
+                    self.Vis_tra_cur_frames['ID'] == track_id].reset_index(drop=True)
+                if len(rows) == 0:
+                    continue
+                row = rows.mean(numeric_only=True).astype(int)
+                row['ID'] = int(track_id)
+                row['timestamp'] = int(timestamp // 1000)
+                cur_rows.append(row)
+            self.Vis_cur = pd.DataFrame(
+                cur_rows,
+                columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+            self.Vis_tra_cur_frames = pd.DataFrame(
+                columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+            if len(self.Vis_cur) > 0:
+                self.Vis_tra = pd.concat([self.Vis_tra, self.Vis_cur], ignore_index=True)
+                self.Vis_tra = self.Vis_tra.drop(
+                    self.Vis_tra[self.Vis_tra['timestamp'] < (timestamp // 1000 - 2 * 60)].index)
+
+        return self.Vis_tra, self.Vis_cur
 
 
 def fusion_bindings(Fus_tra):
@@ -282,7 +319,7 @@ def run(args):
 
     os.makedirs(osp.dirname(result_video), exist_ok=True)
     writer = None
-    Vis_tra = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+    VIS = BoTSORTVISAdapter()
     bin_inf = pd.DataFrame(columns=['ID', 'mmsi', 'timestamp', 'match'])
     times = 0
     frame_id = 0
@@ -318,11 +355,7 @@ def run(args):
             tracker, detections, img_info['raw_img'], timestamp)
         timer.toc()
 
-        Vis_cur = targets_to_vis_cur(online_targets, timestamp, args)
-        if len(Vis_cur) > 0:
-            Vis_tra = pd.concat([Vis_tra, Vis_cur], ignore_index=True)
-            Vis_tra = Vis_tra.drop(
-                Vis_tra[Vis_tra['timestamp'] < (timestamp // 1000 - 2 * 60)].index)
+        Vis_tra, Vis_cur = VIS.feed(online_targets, timestamp, args, ais_update_frame)
         Fus_tra, bin_inf = FUS.fusion(AIS_vis, AIS_cur, Vis_tra, Vis_cur, timestamp)
         apply_fusion_binding_to_tracks(
             online_targets, Fus_tra, ais_frame, tracker, timestamp, args.ais_state_update)
@@ -391,7 +424,7 @@ def make_parser():
     parser.add_argument('--new_track_thresh', default=0.7, type=float)
     parser.add_argument('--track_buffer', type=int, default=30)
     parser.add_argument('--match_thresh', type=float, default=0.8)
-    parser.add_argument('--aspect_ratio_thresh', type=float, default=1.6)
+    parser.add_argument('--aspect_ratio_thresh', type=float, default=10.0)
     parser.add_argument('--min_box_area', type=float, default=10)
     parser.add_argument('--fuse-score', dest='fuse_score', default=False, action='store_true')
 
