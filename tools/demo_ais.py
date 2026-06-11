@@ -19,10 +19,12 @@ if DEEPSORVF_ROOT not in sys.path:
     sys.path.insert(0, DEEPSORVF_ROOT)
 
 from tracker.bot_sort import BoTSORT
+from tracker.ais_fusion import AISFrame
 from tracker.tracking_utils.timer import Timer
 from utils.AIS_utils import AISPRO
 from utils.draw import DRAW
 from utils.file_read import ais_initial, read_all, update_time
+from utils.FUS_utils import FUSPRO
 from utils.gen_result import gen_result
 from yolox.data.data_augment import preproc
 from yolox.exp import get_exp
@@ -56,37 +58,6 @@ def timestamp_to_tracker_ms(value):
     if value > 10000000000:
         return value
     return value * 1000.0
-
-
-def timestamp_to_deepsorvf_sec(value):
-    if value is None:
-        return 0
-    try:
-        if pd.isna(value):
-            return 0
-    except TypeError:
-        pass
-    value = float(value)
-    if value > 10000000000:
-        value /= 1000.0
-    return int(value)
-
-
-def get_value(source, name, default=None):
-    if source is None:
-        return default
-    if isinstance(source, pd.Series):
-        value = source.get(name, default)
-    else:
-        value = getattr(source, name, default)
-    if value is None:
-        return default
-    try:
-        if pd.isna(value):
-            return default
-    except TypeError:
-        pass
-    return value
 
 
 def current_ais_vis(AIS_vis, frame_timestamp_ms):
@@ -128,51 +99,8 @@ def ais_vis_to_records(AIS_vis, frame_timestamp_ms):
     return records
 
 
-def latest_ais_by_mmsi(AIS_vis):
-    ais_latest = {}
-    if AIS_vis is None or len(AIS_vis) == 0 or 'mmsi' not in AIS_vis:
-        return ais_latest
-    for mmsi in AIS_vis['mmsi'].unique():
-        try:
-            mmsi_int = int(mmsi)
-        except (TypeError, ValueError):
-            continue
-        rows = AIS_vis[AIS_vis['mmsi'] == mmsi].reset_index(drop=True)
-        if len(rows) > 0:
-            ais_latest[mmsi_int] = rows.iloc[-1]
-    return ais_latest
-
-
-def target_ais_info(target, ais_latest):
-    ais_id = getattr(target, 'ais_id', None)
-    if ais_id is None:
-        return None
-    try:
-        ais_id = int(ais_id)
-    except (TypeError, ValueError):
-        return None
-
-    obs = getattr(target, 'last_ais_obs', None)
-    fallback = ais_latest.get(ais_id)
-    info = {
-        'mmsi': ais_id,
-        'lon': get_value(obs, 'lon', get_value(fallback, 'lon')),
-        'lat': get_value(obs, 'lat', get_value(fallback, 'lat')),
-        'speed': get_value(obs, 'speed', get_value(fallback, 'speed')),
-        'course': get_value(obs, 'course', get_value(fallback, 'course')),
-        'heading': get_value(obs, 'heading', get_value(fallback, 'heading')),
-        'type': get_value(fallback, 'type', -1),
-        'timestamp': get_value(obs, 'timestamp', get_value(fallback, 'timestamp', 0)),
-    }
-    if any(info[name] is None for name in ['lon', 'lat', 'speed', 'course']):
-        return None
-    return info
-
-
-def targets_to_deepsorvf_frames(online_targets, AIS_vis, frame_timestamp_ms, args):
+def targets_to_vis_cur(online_targets, frame_timestamp_ms, args):
     vis_rows = []
-    fus_rows = []
-    ais_latest = latest_ais_by_mmsi(AIS_vis)
 
     for target in online_targets:
         tlwh = target.tlwh
@@ -198,35 +126,39 @@ def targets_to_deepsorvf_frames(online_targets, AIS_vis, frame_timestamp_ms, arg
             'timestamp': int(frame_timestamp_ms // 1000),
         })
 
-        ais = target_ais_info(target, ais_latest)
-        if ais is None:
-            continue
-        fus_rows.append({
-            'ID': track_id,
-            'mmsi': ais['mmsi'],
-            'lon': ais['lon'],
-            'lat': ais['lat'],
-            'speed': ais['speed'],
-            'course': ais['course'],
-            'heading': ais['heading'],
-            'type': ais['type'],
-            'x1': x1,
-            'y1': y1,
-            'w': int(tlwh[2]),
-            'h': int(tlwh[3]),
-            'timestamp': timestamp_to_deepsorvf_sec(ais['timestamp']),
-        })
-
-    Vis_cur = pd.DataFrame(
+    return pd.DataFrame(
         vis_rows,
         columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
-    Fus_tra = pd.DataFrame(
-        fus_rows,
-        columns=[
-            'ID', 'mmsi', 'lon', 'lat', 'speed', 'course', 'heading', 'type',
-            'x1', 'y1', 'w', 'h', 'timestamp'
-        ])
-    return Vis_cur, Fus_tra
+
+
+def fusion_bindings(Fus_tra):
+    bindings = {}
+    if Fus_tra is None or len(Fus_tra) == 0:
+        return bindings
+    for _, row in Fus_tra.iterrows():
+        try:
+            bindings[int(row['ID'])] = int(row['mmsi'])
+        except (TypeError, ValueError):
+            continue
+    return bindings
+
+
+def apply_fusion_binding_to_tracks(online_targets, Fus_tra, ais_records, tracker,
+                                   timestamp, state_update=False):
+    bindings = fusion_bindings(Fus_tra)
+    if len(bindings) == 0:
+        return
+
+    ais_by_id = AISFrame(ais_records).by_id()
+    for target in online_targets:
+        track_id = int(target.track_id)
+        if track_id not in bindings:
+            continue
+        mmsi = bindings[track_id]
+        obs = ais_by_id.get(mmsi)
+        target.bind_ais(mmsi, obs, tracker.frame_id)
+        if state_update and obs is not None:
+            target.update_by_ais_virtual(obs, tracker.ais_config, timestamp)
 
 
 class Predictor(object):
@@ -295,10 +227,7 @@ def build_predictor(args):
     return Predictor(model, exp, device, args.fp16)
 
 
-def update_tracker(tracker, detections, img, ais_frame, timestamp, use_ais):
-    if use_ais:
-        return tracker.update(detections, img, ais_frame=ais_frame, timestamp=timestamp)
-
+def update_tracker_without_ais(tracker, detections, img, timestamp):
     config = tracker.ais_config
     old_max_age = config.max_age
     old_cost_weight = config.cost_weight
@@ -345,6 +274,7 @@ def run(args):
     frame_step_ms = int(1000 / fps)
 
     AIS = AISPRO(ais_path, ais_file, im_shape, frame_step_ms)
+    FUS = FUSPRO(min(im_shape) // 2, im_shape, frame_step_ms)
     DRA = DRAW(im_shape, frame_step_ms)
     predictor = build_predictor(args)
     tracker = BoTSORT(args, frame_rate=fps)
@@ -353,6 +283,7 @@ def run(args):
     os.makedirs(osp.dirname(result_video), exist_ok=True)
     writer = None
     Vis_tra = pd.DataFrame(columns=['ID', 'x1', 'y1', 'x2', 'y2', 'x', 'y', 'timestamp'])
+    bin_inf = pd.DataFrame(columns=['ID', 'mmsi', 'timestamp', 'match'])
     times = 0
     frame_id = 0
     time_i = 0.0
@@ -383,15 +314,18 @@ def run(args):
         else:
             detections = np.empty((0, 7), dtype=float)
 
-        online_targets = update_tracker(
-            tracker, detections, img_info['raw_img'], ais_frame, timestamp, ais_update_frame)
+        online_targets = update_tracker_without_ais(
+            tracker, detections, img_info['raw_img'], timestamp)
         timer.toc()
 
-        Vis_cur, Fus_tra = targets_to_deepsorvf_frames(online_targets, AIS_vis_current, timestamp, args)
+        Vis_cur = targets_to_vis_cur(online_targets, timestamp, args)
         if len(Vis_cur) > 0:
             Vis_tra = pd.concat([Vis_tra, Vis_cur], ignore_index=True)
             Vis_tra = Vis_tra.drop(
                 Vis_tra[Vis_tra['timestamp'] < (timestamp // 1000 - 2 * 60)].index)
+        Fus_tra, bin_inf = FUS.fusion(AIS_vis, AIS_cur, Vis_tra, Vis_cur, timestamp)
+        apply_fusion_binding_to_tracks(
+            online_targets, Fus_tra, ais_frame, tracker, timestamp, args.ais_state_update)
 
         end = time.time() - start
         time_i += end
@@ -481,6 +415,9 @@ def make_parser():
     parser.add_argument('--ais-occlusion-max-frames', dest='ais_occlusion_max_frames', type=int, default=60)
     parser.add_argument('--ais-cmc-mode', dest='ais_cmc_mode',
                         choices=['none', 'same', 'inverse'], default='inverse')
+    parser.add_argument('--ais-state-update', dest='ais_state_update',
+                        default=False, action='store_true',
+                        help='after FUSPRO binding, correct bound BoT-SORT states with current AIS')
     parser.set_defaults(ablation=False, mot20=False, oar_polygon=None)
     return parser
 
