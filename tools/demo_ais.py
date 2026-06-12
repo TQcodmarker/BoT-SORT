@@ -143,7 +143,7 @@ def make_parser():
     parser.add_argument('--min_box_area', type=float, default=10)
     parser.add_argument('--fuse-score', dest='fuse_score', default=False, action='store_true')
 
-    parser.add_argument('--cmc-method', dest='cmc_method', default='orb', type=str)
+    parser.add_argument('--cmc-method', dest='cmc_method', default='none', type=str)
     parser.add_argument('--with-reid', dest='with_reid', default=False, action='store_true')
     parser.add_argument('--fast-reid-config', dest='fast_reid_config',
                         default='fast_reid/configs/MOT17/sbs_S50.yml')
@@ -153,16 +153,16 @@ def make_parser():
     parser.add_argument('--appearance_thresh', type=float, default=0.25)
 
     parser.add_argument('--ais-max-age', dest='ais_max_age', type=float, default=2.0)
-    parser.add_argument('--ais-kappa', dest='ais_kappa', type=float, default=0.5)
-    parser.add_argument('--ais-position-var', dest='ais_position_var', type=float, default=4.0)
+    parser.add_argument('--ais-kappa', dest='ais_kappa', type=float, default=0.7)
+    parser.add_argument('--ais-position-var', dest='ais_position_var', type=float, default=25.0)
     parser.add_argument('--ais-scale-var', dest='ais_scale_var', type=float, default=1000000.0)
-    parser.add_argument('--ais-bind-distance', dest='ais_bind_distance', type=float, default=120.0)
-    parser.add_argument('--ais-cost-weight', dest='ais_cost_weight', type=float, default=0.25)
-    parser.add_argument('--ais-heading-weight', dest='ais_heading_weight', type=float, default=0.05)
-    parser.add_argument('--ais-occlusion-min-score', dest='ais_occlusion_min_score', type=float, default=0.4)
+    parser.add_argument('--ais-bind-distance', dest='ais_bind_distance', type=float, default=80.0)
+    parser.add_argument('--ais-cost-weight', dest='ais_cost_weight', type=float, default=0.15)
+    parser.add_argument('--ais-heading-weight', dest='ais_heading_weight', type=float, default=0.0)
+    parser.add_argument('--ais-occlusion-min-score', dest='ais_occlusion_min_score', type=float, default=0.5)
     parser.add_argument('--ais-occlusion-max-frames', dest='ais_occlusion_max_frames', type=int, default=60)
     parser.add_argument('--ais-cmc-mode', dest='ais_cmc_mode',
-                        choices=['none', 'same', 'inverse'], default='inverse')
+                        choices=['none', 'same', 'inverse'], default='none')
     parser.set_defaults(ablation=False, mot20=False, oar_polygon=None)
     return parser
 
