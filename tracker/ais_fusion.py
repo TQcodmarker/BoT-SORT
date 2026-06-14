@@ -355,7 +355,7 @@ class AISFusionConfig(object):
         track_conf = 1.0 if track_conf is None else float(np.clip(track_conf, 0.0, 1.0))
         detection_conf = track_conf if detection_conf is None else float(np.clip(detection_conf, 0.0, 1.0))
 
-        if occlusion_score < 0.2 and track_conf >= 0.6 and detection_conf >= 0.5:
+        if occlusion_score < 0.3 and track_conf >= 0.75 and detection_conf >= 0.70:
             return 0.0
         if occlusion_score < 0.5:
             weight = 0.3 + 0.4 * occlusion_score
@@ -366,11 +366,33 @@ class AISFusionConfig(object):
         return float(np.clip(weight, 0.0, 1.0))
 
     def motion_weight(self, track, obs, timestamp, detection_conf=None):
+        return self.motion_weight_details(
+            track, obs, timestamp, detection_conf=detection_conf)['ais_weight']
+
+    def motion_weight_details(self, track, obs, timestamp, detection_conf=None):
+        details = {
+            'occlusion_score': 0.0,
+            'track_conf': 0.0,
+            'detection_conf': 0.0,
+            'ais_conf': 0.0,
+            'gate_weight': 0.0,
+            'ais_weight': 0.0,
+        }
         if obs is None:
-            return 0.0
+            return details
+
+        track_conf = getattr(track, 'score', 1.0)
+        track_conf = float(np.clip(track_conf, 0.0, 1.0))
+        if detection_conf is None:
+            detection_conf = track_conf
+        detection_conf = float(np.clip(detection_conf, 0.0, 1.0))
+        details['track_conf'] = track_conf
+        details['detection_conf'] = detection_conf
+
         ais_conf = self.reliability(obs, timestamp)
+        details['ais_conf'] = ais_conf
         if ais_conf <= 0:
-            return 0.0
+            return details
 
         state_name = track.state
         if state_name in (2, 5):  # TrackState.Lost / TrackState.Occluded
@@ -378,14 +400,18 @@ class AISFusionConfig(object):
         elif getattr(track, 'occluded_since', None) is not None:
             occlusion_score = 0.8
         else:
-            track_conf = getattr(track, 'score', 1.0)
-            occlusion_score = 1.0 - float(np.clip(track_conf, 0.0, 1.0))
+            occlusion_score = max(1.0 - track_conf, 1.0 - detection_conf)
+        occlusion_score = float(np.clip(occlusion_score, 0.0, 1.0))
+        details['occlusion_score'] = occlusion_score
 
         gate_weight = self.occlusion_aware_weight(
             occlusion_score,
-            track_conf=getattr(track, 'score', 1.0),
+            track_conf=track_conf,
             detection_conf=detection_conf)
-        return float(np.clip(gate_weight * ais_conf * self.motion_max_weight, 0.0, 1.0))
+        details['gate_weight'] = gate_weight
+        details['ais_weight'] = float(np.clip(
+            gate_weight * ais_conf * self.motion_max_weight, 0.0, 1.0))
+        return details
 
     def can_output_occluded(self, track, obs, timestamp, frame_id):
         if obs is None or track is None or track.mean is None:

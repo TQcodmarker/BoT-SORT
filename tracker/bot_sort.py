@@ -1,3 +1,6 @@
+import csv
+import os
+
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -58,14 +61,34 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks, ais_obs_by_id=None, ais_config=None, timestamp=None):
+    def multi_predict(stracks, ais_obs_by_id=None, ais_config=None, timestamp=None,
+                      detection_conf_by_track_id=None, debug_rows=None):
         if len(stracks) == 0:
             return
 
         normal_tracks = []
         for i, st in enumerate(stracks):
             obs = None if ais_obs_by_id is None else ais_obs_by_id.get(st.ais_id)
-            ais_weight = 0.0 if obs is None or ais_config is None else ais_config.motion_weight(st, obs, timestamp)
+            detection_conf = None
+            if detection_conf_by_track_id is not None:
+                detection_conf = detection_conf_by_track_id.get(st.track_id, 0.0)
+            if obs is None or ais_config is None:
+                weight_details = {
+                    'occlusion_score': 0.0,
+                    'track_conf': float(np.clip(getattr(st, 'score', 0.0), 0.0, 1.0)),
+                    'detection_conf': 0.0 if detection_conf is None else float(np.clip(detection_conf, 0.0, 1.0)),
+                    'ais_conf': 0.0,
+                    'gate_weight': 0.0,
+                    'ais_weight': 0.0,
+                }
+            else:
+                weight_details = ais_config.motion_weight_details(
+                    st, obs, timestamp, detection_conf=detection_conf)
+            ais_weight = weight_details['ais_weight']
+            visual_vx = None if st.mean is None else float(st.mean[4])
+            visual_vy = None if st.mean is None else float(st.mean[5])
+            fused_vx = visual_vx
+            fused_vy = visual_vy
             if obs is not None and ais_weight > 0 and (obs.vx is not None or obs.vy is not None):
                 mean_state = st.mean.copy()
                 if st.state != TrackState.Tracked and st.state != TrackState.Occluded:
@@ -76,11 +99,30 @@ class STrack(BaseTrack):
                     mean_state[4] = (1.0 - ais_weight) * visual_vx + ais_weight * obs.vx
                 if obs.vy is not None:
                     mean_state[5] = (1.0 - ais_weight) * visual_vy + ais_weight * obs.vy
+                fused_vx, fused_vy = float(mean_state[4]), float(mean_state[5])
                 motion_cov_scale = max(0.25, 1.0 - 0.5 * ais_weight)
                 st.mean, st.covariance = STrack.shared_kalman.predict(
                     mean_state, st.covariance, motion_cov_scale=motion_cov_scale)
             else:
                 normal_tracks.append(st)
+            if debug_rows is not None:
+                debug_rows.append({
+                    'track_id': getattr(st, 'track_id', None),
+                    'ais_id': getattr(st, 'ais_id', None),
+                    'track_state': getattr(st, 'state', None),
+                    'occlusion_score': weight_details['occlusion_score'],
+                    'track_conf': weight_details['track_conf'],
+                    'detection_conf': weight_details['detection_conf'],
+                    'ais_conf': weight_details['ais_conf'],
+                    'gate_weight': weight_details['gate_weight'],
+                    'ais_weight': weight_details['ais_weight'],
+                    'visual_vx': visual_vx,
+                    'visual_vy': visual_vy,
+                    'ais_vx': None if obs is None else obs.vx,
+                    'ais_vy': None if obs is None else obs.vy,
+                    'fused_vx': fused_vx,
+                    'fused_vy': fused_vy,
+                })
 
         if len(normal_tracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in normal_tracks])
@@ -305,6 +347,52 @@ class BoTSORT(object):
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
         self.ais_config = AISFusionConfig.from_args(args)
         self.ais_buffer = None
+        self.ais_debug_enabled = bool(getattr(args, 'ais_debug_enabled', False))
+        self.ais_debug_path = getattr(args, 'ais_debug_path', None)
+        self._ais_debug_header_written = False
+
+    def _detection_conf_by_track(self, tracks, detections):
+        conf_by_id = {}
+        if len(tracks) == 0 or len(detections) == 0:
+            return conf_by_id
+        iou_dists = matching.iou_distance(tracks, detections)
+        for ti, track in enumerate(tracks):
+            if iou_dists.shape[1] == 0:
+                continue
+            best_det = int(np.argmin(iou_dists[ti]))
+            best_iou = 1.0 - float(iou_dists[ti, best_det])
+            if best_iou <= 0:
+                conf_by_id[track.track_id] = 0.0
+            else:
+                conf_by_id[track.track_id] = float(np.clip(
+                    detections[best_det].score * best_iou, 0.0, 1.0))
+        return conf_by_id
+
+    def _write_ais_debug_rows(self, rows, timestamp):
+        if not self.ais_debug_enabled or self.ais_debug_path is None or len(rows) == 0:
+            return
+        debug_dir = os.path.dirname(self.ais_debug_path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        fieldnames = [
+            'frame_id', 'timestamp', 'track_id', 'ais_id', 'track_state',
+            'occlusion_score', 'track_conf', 'detection_conf',
+            'ais_conf', 'gate_weight', 'ais_weight',
+            'visual_vx', 'visual_vy', 'ais_vx', 'ais_vy',
+            'fused_vx', 'fused_vy',
+        ]
+        write_header = not self._ais_debug_header_written
+        mode = 'w' if write_header else 'a'
+        with open(self.ais_debug_path, mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            for row in rows:
+                row = dict(row)
+                row['frame_id'] = self.frame_id
+                row['timestamp'] = timestamp
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        self._ais_debug_header_written = True
 
     def _ais_observations_for_tracks(self, tracks, current_ais_by_id, timestamp):
         obs_by_id = dict(current_ais_by_id)
@@ -477,7 +565,13 @@ class BoTSORT(object):
         ais_by_track_id = self._ais_observations_for_tracks(strack_pool, ais_by_id, timestamp)
 
         # Predict the current location with KF
-        STrack.multi_predict(strack_pool, ais_by_track_id, self.ais_config, timestamp)
+        detection_conf_by_track_id = self._detection_conf_by_track(strack_pool, detections)
+        ais_debug_rows = []
+        STrack.multi_predict(
+            strack_pool, ais_by_track_id, self.ais_config, timestamp,
+            detection_conf_by_track_id=detection_conf_by_track_id,
+            debug_rows=ais_debug_rows)
+        self._write_ais_debug_rows(ais_debug_rows, timestamp)
 
         # Fix camera motion
         warp = self.gmc.apply(img, dets)
