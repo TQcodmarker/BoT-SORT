@@ -28,7 +28,8 @@ class AISObservation(object):
 
     def __init__(self, ais_id, x, y, timestamp=None, speed=None, course=None,
                  heading=None, vx=None, vy=None, position_var=None,
-                 reliability=1.0, lon=None, lat=None):
+                 reliability=1.0, lon=None, lat=None, speed_variance=None,
+                 continuity=1.0, vx_ground=None, vy_ground=None):
         self.ais_id = ais_id
         self.x = float(x)
         self.y = float(y)
@@ -44,6 +45,10 @@ class AISObservation(object):
         self.reliability = float(reliability)
         self.lon = lon
         self.lat = lat
+        self.speed_variance = speed_variance
+        self.continuity = float(continuity)
+        self.vx_ground = vx_ground
+        self.vy_ground = vy_ground
 
     @property
     def xy(self):
@@ -54,7 +59,9 @@ class AISObservation(object):
             self.ais_id, self.x, self.y, timestamp=self.timestamp,
             speed=self.speed, course=self.course, heading=self.heading,
             vx=self.vx, vy=self.vy, position_var=self.position_var,
-            reliability=self.reliability, lon=self.lon, lat=self.lat)
+            reliability=self.reliability, lon=self.lon, lat=self.lat,
+            speed_variance=self.speed_variance, continuity=self.continuity,
+            vx_ground=self.vx_ground, vy_ground=self.vy_ground)
         obs.raw_x = self.raw_x
         obs.raw_y = self.raw_y
         return obs
@@ -108,7 +115,11 @@ class AISFrame(object):
                 position_var=record.get('position_var'),
                 reliability=record.get('reliability', 1.0),
                 lon=record.get('lon'),
-                lat=record.get('lat'))
+                lat=record.get('lat'),
+                speed_variance=record.get('speed_variance'),
+                continuity=record.get('continuity', 1.0),
+                vx_ground=record.get('vx_ground'),
+                vy_ground=record.get('vy_ground'))
 
         try:
             record_len = len(record)
@@ -279,7 +290,9 @@ class AISFusionConfig(object):
     def __init__(self, max_age=2.0, kappa=0.5, position_var=4.0,
                  scale_var=1000000.0, bind_distance=120.0, cost_weight=0.25,
                  heading_weight=0.05, occlusion_min_score=0.4,
-                 occlusion_max_frames=60, cmc_mode='inverse'):
+                 occlusion_max_frames=60, cmc_mode='inverse',
+                 motion_max_weight=1.0, max_speed_variance=4.0,
+                 enable_virtual_update=False):
         self.max_age = max_age
         self.kappa = kappa
         self.position_var = position_var
@@ -290,6 +303,9 @@ class AISFusionConfig(object):
         self.occlusion_min_score = occlusion_min_score
         self.occlusion_max_frames = occlusion_max_frames
         self.cmc_mode = cmc_mode
+        self.motion_max_weight = motion_max_weight
+        self.max_speed_variance = max_speed_variance
+        self.enable_virtual_update = enable_virtual_update
 
     @classmethod
     def from_args(cls, args):
@@ -303,7 +319,10 @@ class AISFusionConfig(object):
             heading_weight=getattr(args, 'ais_heading_weight', 0.05),
             occlusion_min_score=getattr(args, 'ais_occlusion_min_score', 0.4),
             occlusion_max_frames=getattr(args, 'ais_occlusion_max_frames', 60),
-            cmc_mode=getattr(args, 'ais_cmc_mode', 'inverse'))
+            cmc_mode=getattr(args, 'ais_cmc_mode', 'inverse'),
+            motion_max_weight=getattr(args, 'ais_motion_max_weight', 1.0),
+            max_speed_variance=getattr(args, 'ais_max_speed_variance', 4.0),
+            enable_virtual_update=getattr(args, 'ais_enable_virtual_update', False))
 
     def delta_t(self, obs, timestamp):
         obs_time = _timestamp_to_seconds(getattr(obs, 'timestamp', None))
@@ -317,7 +336,73 @@ class AISFusionConfig(object):
         delta_t = self.delta_t(obs, timestamp)
         if delta_t > self.max_age:
             return 0.0
-        return reliability * math.exp(-self.kappa * delta_t)
+        time_conf = math.exp(-self.kappa * delta_t)
+
+        speed_variance = getattr(obs, 'speed_variance', None)
+        if speed_variance is None:
+            speed_conf = 1.0
+        else:
+            speed_conf = math.exp(
+                -max(0.0, float(speed_variance)) /
+                max(self.max_speed_variance, 1e-6))
+
+        continuity = np.clip(getattr(obs, 'continuity', 1.0), 0.0, 1.0)
+        return float(np.clip(reliability * time_conf * speed_conf * continuity, 0.0, 1.0))
+
+    def occlusion_aware_weight(self, occlusion_score, track_conf=None,
+                               detection_conf=None):
+        occlusion_score = float(np.clip(occlusion_score, 0.0, 1.0))
+        track_conf = 1.0 if track_conf is None else float(np.clip(track_conf, 0.0, 1.0))
+        detection_conf = track_conf if detection_conf is None else float(np.clip(detection_conf, 0.0, 1.0))
+
+        if occlusion_score < 0.2 and track_conf >= 0.6 and detection_conf >= 0.5:
+            return 0.0
+        if occlusion_score < 0.5:
+            weight = 0.3 + 0.4 * occlusion_score
+        else:
+            weight = 0.7 + 0.3 * occlusion_score
+        if track_conf < 0.5 or detection_conf < 0.4:
+            weight = max(weight, 0.7)
+        return float(np.clip(weight, 0.0, 1.0))
+
+    def motion_weight(self, track, obs, timestamp, detection_conf=None):
+        if obs is None:
+            return 0.0
+        ais_conf = self.reliability(obs, timestamp)
+        if ais_conf <= 0:
+            return 0.0
+
+        state_name = track.state
+        if state_name in (2, 5):  # TrackState.Lost / TrackState.Occluded
+            occlusion_score = 1.0
+        elif getattr(track, 'occluded_since', None) is not None:
+            occlusion_score = 0.8
+        else:
+            track_conf = getattr(track, 'score', 1.0)
+            occlusion_score = 1.0 - float(np.clip(track_conf, 0.0, 1.0))
+
+        gate_weight = self.occlusion_aware_weight(
+            occlusion_score,
+            track_conf=getattr(track, 'score', 1.0),
+            detection_conf=detection_conf)
+        return float(np.clip(gate_weight * ais_conf * self.motion_max_weight, 0.0, 1.0))
+
+    def can_output_occluded(self, track, obs, timestamp, frame_id):
+        if obs is None or track is None or track.mean is None:
+            return False
+        if getattr(track, 'state', None) != 5:  # TrackState.Occluded
+            return False
+        occluded_since = getattr(track, 'occluded_since', None)
+        if occluded_since is None:
+            return False
+        if frame_id - occluded_since > self.occlusion_max_frames:
+            return False
+        if self.reliability(obs, timestamp) < self.occlusion_min_score:
+            return False
+        if self.motion_weight(track, obs, timestamp) < self.occlusion_min_score:
+            return False
+        w, h = float(track.mean[2]), float(track.mean[3])
+        return w > 1.0 and h > 1.0
 
     def position_variance(self, obs, timestamp):
         base = obs.position_var if obs.position_var is not None else self.position_var

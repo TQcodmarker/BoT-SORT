@@ -65,17 +65,18 @@ class STrack(BaseTrack):
         normal_tracks = []
         for i, st in enumerate(stracks):
             obs = None if ais_obs_by_id is None else ais_obs_by_id.get(st.ais_id)
-            reliability = 0.0 if obs is None or ais_config is None else ais_config.reliability(obs, timestamp)
-            if obs is not None and reliability > 0 and (obs.vx is not None or obs.vy is not None):
+            ais_weight = 0.0 if obs is None or ais_config is None else ais_config.motion_weight(st, obs, timestamp)
+            if obs is not None and ais_weight > 0 and (obs.vx is not None or obs.vy is not None):
                 mean_state = st.mean.copy()
                 if st.state != TrackState.Tracked and st.state != TrackState.Occluded:
                     mean_state[6] = 0
                     mean_state[7] = 0
+                visual_vx, visual_vy = mean_state[4], mean_state[5]
                 if obs.vx is not None:
-                    mean_state[4] = obs.vx
+                    mean_state[4] = (1.0 - ais_weight) * visual_vx + ais_weight * obs.vx
                 if obs.vy is not None:
-                    mean_state[5] = obs.vy
-                motion_cov_scale = max(0.25, 1.0 - 0.5 * reliability)
+                    mean_state[5] = (1.0 - ais_weight) * visual_vy + ais_weight * obs.vy
+                motion_cov_scale = max(0.25, 1.0 - 0.5 * ais_weight)
                 st.mean, st.covariance = STrack.shared_kalman.predict(
                     mean_state, st.covariance, motion_cov_scale=motion_cov_scale)
             else:
@@ -401,7 +402,8 @@ class BoTSORT(object):
             if ti in used_tracks or oi in used_obs:
                 continue
             tracks[ti].bind_ais(candidates[oi].ais_id, candidates[oi], self.frame_id)
-            tracks[ti].update_by_ais_virtual(candidates[oi], self.ais_config, timestamp)
+            if self.ais_config.enable_virtual_update:
+                tracks[ti].update_by_ais_virtual(candidates[oi], self.ais_config, timestamp)
             used_tracks.add(ti)
             used_obs.add(oi)
             used_ais_ids.add(candidates[oi].ais_id)
@@ -527,7 +529,7 @@ class BoTSORT(object):
                 refind_stracks.append(track)
 
         for track in activated_starcks + refind_stracks:
-            if track.ais_id in ais_by_track_id:
+            if self.ais_config.enable_virtual_update and track.ais_id in ais_by_track_id:
                 track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
 
         ''' Step 3: Second association, with low score detection boxes'''
@@ -568,14 +570,15 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-            if track.ais_id in ais_by_track_id:
+            if self.ais_config.enable_virtual_update and track.ais_id in ais_by_track_id:
                 track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
 
         for it in u_track:
             track = r_tracked_stracks[it]
             if self._can_mark_occluded(track, ais_by_track_id, timestamp):
                 track.mark_occluded(self.frame_id)
-                track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
+                if self.ais_config.enable_virtual_update:
+                    track.update_by_ais_virtual(ais_by_track_id[track.ais_id], self.ais_config, timestamp)
                 lost_stracks.append(track)
             elif not track.state == TrackState.Lost:
                 track.mark_lost()
@@ -643,6 +646,16 @@ class BoTSORT(object):
 
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks = [track for track in self.tracked_stracks]
+        output_ids = set([track.track_id for track in output_stracks])
+        for track in self.lost_stracks:
+            if track.state != TrackState.Occluded:
+                continue
+            if track.track_id in output_ids:
+                continue
+            obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
+            if self.ais_config.can_output_occluded(track, obs, timestamp, self.frame_id):
+                output_stracks.append(track)
+                output_ids.add(track.track_id)
 
 
         return output_stracks
