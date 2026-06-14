@@ -11,6 +11,7 @@ from tracker.gmc import GMC
 from tracker.basetrack import BaseTrack, TrackState
 from tracker.kalman_filter import KalmanFilter
 from tracker.ais_fusion import AISBuffer, AISFrame, AISFusionConfig
+from tracker.os_tgor import OcclusionStateGraphReasoner
 
 
 class STrack(BaseTrack):
@@ -39,6 +40,8 @@ class STrack(BaseTrack):
         self.last_ais_time = None
         self.ais_reliability = 0.0
         self.occluded_since = None
+        self.occlusion_state = 0.0
+        self.track_reliability = float(np.clip(score, 0.0, 1.0))
 
     def update_features(self, feat):
         if self.freeze_feature:
@@ -83,7 +86,8 @@ class STrack(BaseTrack):
                 }
             else:
                 weight_details = ais_config.motion_weight_details(
-                    st, obs, timestamp, detection_conf=detection_conf)
+                    st, obs, timestamp, detection_conf=detection_conf,
+                    occlusion_state=getattr(st, 'occlusion_state', None))
             ais_weight = weight_details['ais_weight']
             visual_vx = None if st.mean is None else float(st.mean[4])
             visual_vy = None if st.mean is None else float(st.mean[5])
@@ -111,6 +115,8 @@ class STrack(BaseTrack):
                     'ais_id': getattr(st, 'ais_id', None),
                     'track_state': getattr(st, 'state', None),
                     'occlusion_score': weight_details['occlusion_score'],
+                    'tgor_state': getattr(st, 'occlusion_state', 0.0),
+                    'track_reliability': getattr(st, 'track_reliability', 0.0),
                     'track_conf': weight_details['track_conf'],
                     'detection_conf': weight_details['detection_conf'],
                     'ais_conf': weight_details['ais_conf'],
@@ -166,6 +172,8 @@ class STrack(BaseTrack):
         self.state = TrackState.Tracked
         self.freeze_feature = False
         self.occluded_since = None
+        self.occlusion_state = 0.0
+        self.track_reliability = float(np.clip(self.score, 0.0, 1.0))
         if frame_id == 1:
             self.is_activated = True
         self.frame_id = frame_id
@@ -180,6 +188,8 @@ class STrack(BaseTrack):
         self.state = TrackState.Tracked
         self.freeze_feature = False
         self.occluded_since = None
+        self.occlusion_state = max(0.0, 0.5 * getattr(self, 'occlusion_state', 0.0))
+        self.track_reliability = float(np.clip(self.score, 0.0, 1.0))
         self.is_activated = True
         self.frame_id = frame_id
         if new_id:
@@ -209,6 +219,8 @@ class STrack(BaseTrack):
         self.state = TrackState.Tracked
         self.freeze_feature = False
         self.occluded_since = None
+        self.occlusion_state = max(0.0, 0.5 * getattr(self, 'occlusion_state', 0.0))
+        self.track_reliability = float(np.clip(self.score, 0.0, 1.0))
         self.is_activated = True
 
         self.score = new_track.score
@@ -231,6 +243,7 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
         if self.occluded_since is None:
             self.occluded_since = frame_id
+        self.occlusion_state = max(getattr(self, 'occlusion_state', 0.0), 0.75)
 
     def update_by_ais_virtual(self, obs, config, timestamp=None):
         if obs is None or self.mean is None or self.kalman_filter is None:
@@ -350,6 +363,12 @@ class BoTSORT(object):
         self.ais_debug_enabled = bool(getattr(args, 'ais_debug_enabled', False))
         self.ais_debug_path = getattr(args, 'ais_debug_path', None)
         self._ais_debug_header_written = False
+        self.tgor_debug_enabled = bool(getattr(args, 'tgor_debug_enabled', self.ais_debug_enabled))
+        self.tgor_node_debug_path = getattr(args, 'tgor_node_debug_path', self.ais_debug_path)
+        self.tgor_edge_debug_path = getattr(args, 'tgor_edge_debug_path', None)
+        self._tgor_node_debug_header_written = False
+        self._tgor_edge_debug_header_written = False
+        self.occlusion_reasoner = OcclusionStateGraphReasoner.from_args(args)
 
     def _detection_conf_by_track(self, tracks, detections):
         conf_by_id = {}
@@ -376,7 +395,8 @@ class BoTSORT(object):
             os.makedirs(debug_dir, exist_ok=True)
         fieldnames = [
             'frame_id', 'timestamp', 'track_id', 'ais_id', 'track_state',
-            'occlusion_score', 'track_conf', 'detection_conf',
+            'occlusion_score', 'tgor_state', 'track_reliability',
+            'track_conf', 'detection_conf',
             'ais_conf', 'gate_weight', 'ais_weight',
             'visual_vx', 'visual_vy', 'ais_vx', 'ais_vy',
             'fused_vx', 'fused_vy',
@@ -393,6 +413,102 @@ class BoTSORT(object):
                 row['timestamp'] = timestamp
                 writer.writerow({key: row.get(key) for key in fieldnames})
         self._ais_debug_header_written = True
+
+    def _write_tgor_node_debug_rows(self, tracks, ais_by_track_id, timestamp,
+                                    stage, detection_conf_by_track_id):
+        if not self.tgor_debug_enabled or self.tgor_node_debug_path is None or len(tracks) == 0:
+            return
+        debug_dir = os.path.dirname(self.tgor_node_debug_path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        fieldnames = [
+            'frame_id', 'timestamp', 'stage', 'track_id', 'ais_id',
+            'track_state', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h',
+            'visual_vx', 'visual_vy', 'ais_vx', 'ais_vy',
+            'score', 'detection_conf', 'ais_reliability',
+            'graph_risk', 'history_risk', 'ais_inconsistency',
+            'raw_state', 'prev_state', 'tgor_state',
+            'track_reliability', 'dynamic_max_time_lost',
+        ]
+        write_header = not self._tgor_node_debug_header_written
+        mode = 'w' if write_header else 'a'
+        details = getattr(self.occlusion_reasoner, 'last_node_details', {})
+        with open(self.tgor_node_debug_path, mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            for track in tracks:
+                node = details.get(track.track_id, {})
+                obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
+                ais_rel = 0.0 if obs is None else self.ais_config.reliability(obs, timestamp)
+                if getattr(track, 'mean', None) is not None:
+                    x, y, w, h = [float(v) for v in track.mean[:4]]
+                    vx, vy = float(track.mean[4]), float(track.mean[5])
+                else:
+                    xywh = track.to_xywh()
+                    x, y, w, h = [float(v) for v in xywh[:4]]
+                    vx, vy = None, None
+                writer.writerow({
+                    'frame_id': self.frame_id,
+                    'timestamp': timestamp,
+                    'stage': stage,
+                    'track_id': track.track_id,
+                    'ais_id': track.ais_id,
+                    'track_state': track.state,
+                    'bbox_x': x,
+                    'bbox_y': y,
+                    'bbox_w': w,
+                    'bbox_h': h,
+                    'visual_vx': vx,
+                    'visual_vy': vy,
+                    'ais_vx': None if obs is None else obs.vx,
+                    'ais_vy': None if obs is None else obs.vy,
+                    'score': getattr(track, 'score', None),
+                    'detection_conf': None if detection_conf_by_track_id is None else
+                    detection_conf_by_track_id.get(track.track_id, 0.0),
+                    'ais_reliability': ais_rel,
+                    'graph_risk': node.get('graph_risk'),
+                    'history_risk': node.get('history_risk'),
+                    'ais_inconsistency': node.get('ais_inconsistency'),
+                    'raw_state': node.get('raw_state'),
+                    'prev_state': node.get('prev_state'),
+                    'tgor_state': getattr(track, 'occlusion_state', 0.0),
+                    'track_reliability': getattr(track, 'track_reliability', 0.0),
+                    'dynamic_max_time_lost': self._dynamic_max_time_lost(track),
+                })
+        self._tgor_node_debug_header_written = True
+
+    def _write_tgor_edge_debug_rows(self, timestamp, stage):
+        if not self.tgor_debug_enabled or self.tgor_edge_debug_path is None:
+            return
+        edge_rows = getattr(self.occlusion_reasoner, 'last_edge_details', [])
+        if len(edge_rows) == 0:
+            return
+        debug_dir = os.path.dirname(self.tgor_edge_debug_path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        fieldnames = [
+            'frame_id', 'timestamp', 'stage', 'track_i', 'track_j',
+            'distance', 'relative_velocity', 'direction_similarity',
+            'future_convergence', 'distance_score', 'velocity_score',
+            'ais_consistency', 'edge_risk',
+        ]
+        write_header = not self._tgor_edge_debug_header_written
+        mode = 'w' if write_header else 'a'
+        min_edge_risk = getattr(self.args, 'tgor_edge_debug_min_risk', 0.05)
+        with open(self.tgor_edge_debug_path, mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            for row in edge_rows:
+                if row.get('edge_risk', 0.0) < min_edge_risk:
+                    continue
+                out = dict(row)
+                out['frame_id'] = self.frame_id
+                out['timestamp'] = timestamp
+                out['stage'] = stage
+                writer.writerow({key: out.get(key) for key in fieldnames})
+        self._tgor_edge_debug_header_written = True
 
     def _ais_observations_for_tracks(self, tracks, current_ais_by_id, timestamp):
         obs_by_id = dict(current_ais_by_id)
@@ -440,6 +556,9 @@ class BoTSORT(object):
         return inside
 
     def _can_mark_occluded(self, track, ais_by_track_id, timestamp):
+        tgor_state = float(np.clip(getattr(track, 'occlusion_state', 0.0), 0.0, 1.0))
+        if tgor_state < getattr(self.args, 'tgor_occlusion_mark_thresh', 0.35):
+            return False
         if track.ais_id not in ais_by_track_id:
             return False
         obs = ais_by_track_id[track.ais_id]
@@ -451,6 +570,27 @@ class BoTSORT(object):
             if self.frame_id - track.occluded_since > self.ais_config.occlusion_max_frames:
                 return False
         return True
+
+    def _update_tgor_states(self, tracks, ais_by_track_id, timestamp,
+                            detection_conf_by_track_id, stage='unknown'):
+        states = self.occlusion_reasoner.compute_occlusion_state(
+            tracks,
+            ais_obs_by_id=ais_by_track_id,
+            timestamp=timestamp,
+            detection_conf_by_track_id=detection_conf_by_track_id)
+        for track in tracks:
+            track.occlusion_state = states.get(track.track_id, 0.0)
+            track.track_reliability = self.occlusion_reasoner.compute_reliability(
+                track, ais_by_track_id, timestamp, self.ais_config)
+        self._write_tgor_node_debug_rows(
+            tracks, ais_by_track_id, timestamp, stage, detection_conf_by_track_id)
+        self._write_tgor_edge_debug_rows(timestamp, stage)
+        return states
+
+    def _dynamic_max_time_lost(self, track):
+        s = float(np.clip(getattr(track, 'occlusion_state', 0.0), 0.0, 1.0))
+        scale = 1.0 + getattr(self.args, 'tgor_lifecycle_extend', 1.0) * s
+        return int(round(self.max_time_lost * scale))
 
     def _apply_ais_cmc(self, ais_frame, warp):
         mode = self.ais_config.cmc_mode
@@ -566,6 +706,9 @@ class BoTSORT(object):
 
         # Predict the current location with KF
         detection_conf_by_track_id = self._detection_conf_by_track(strack_pool, detections)
+        self._update_tgor_states(
+            strack_pool, ais_by_track_id, timestamp, detection_conf_by_track_id,
+            stage='pre_predict')
         ais_debug_rows = []
         STrack.multi_predict(
             strack_pool, ais_by_track_id, self.ais_config, timestamp,
@@ -580,6 +723,10 @@ class BoTSORT(object):
         ais_by_track_id = self._ais_observations_for_tracks(strack_pool, ais_by_id, timestamp)
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
+        detection_conf_by_track_id = self._detection_conf_by_track(strack_pool, detections)
+        self._update_tgor_states(
+            strack_pool, ais_by_track_id, timestamp, detection_conf_by_track_id,
+            stage='pre_association')
 
         # Associate with high score detection boxes
         ious_dists = matching.iou_distance(strack_pool, detections)
@@ -593,7 +740,7 @@ class BoTSORT(object):
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
-            dists = np.minimum(ious_dists, emb_dists)
+            base_dists = np.minimum(ious_dists, emb_dists)
 
             # Popular ReID method (JDE / FairMOT)
             # raw_emb_dists = matching.embedding_distance(strack_pool, detections)
@@ -604,8 +751,20 @@ class BoTSORT(object):
             # dists = matching.embedding_distance(strack_pool, detections)
             # dists[ious_dists_mask] = 1.0
         else:
-            dists = ious_dists
+            emb_dists = ious_dists.copy()
+            base_dists = ious_dists
 
+        ais_dists = matching.ais_projection_distance(
+            strack_pool, detections, ais_by_track_id, self.ais_config, timestamp)
+        for row, track in enumerate(strack_pool):
+            obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
+            if obs is None or self.ais_config.reliability(obs, timestamp) <= 0:
+                ais_dists[row] = ious_dists[row]
+        motion_dists = matching.motion_distance(
+            self.kalman_filter, strack_pool, detections)
+        dists = matching.fuse_occlusion_aware(
+            ious_dists, emb_dists, motion_dists, ais_dists, strack_pool,
+            reid_available=self.args.with_reid)
         dists = matching.fuse_ais(
             dists, strack_pool, detections, ais_by_track_id,
             self.ais_config, timestamp)
@@ -651,9 +810,22 @@ class BoTSORT(object):
                              if strack_pool[i].state == TrackState.Tracked
                              or strack_pool[i].state == TrackState.Occluded]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
-        dists = matching.fuse_ais(
-            dists, r_tracked_stracks, detections_second, ais_by_track_id,
-            self.ais_config, timestamp)
+        if dists.size > 0:
+            ais_dists_second = matching.ais_projection_distance(
+                r_tracked_stracks, detections_second, ais_by_track_id,
+                self.ais_config, timestamp)
+            for row, track in enumerate(r_tracked_stracks):
+                obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
+                if obs is None or self.ais_config.reliability(obs, timestamp) <= 0:
+                    ais_dists_second[row] = dists[row]
+            motion_dists_second = matching.motion_distance(
+                self.kalman_filter, r_tracked_stracks, detections_second)
+            dists = matching.fuse_occlusion_aware(
+                dists, dists.copy(), motion_dists_second, ais_dists_second,
+                r_tracked_stracks, reid_available=False)
+            dists = matching.fuse_ais(
+                dists, r_tracked_stracks, detections_second, ais_by_track_id,
+                self.ais_config, timestamp)
         matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -720,10 +892,14 @@ class BoTSORT(object):
         """ Step 5: Update state"""
         for track in self.lost_stracks:
             if track.state == TrackState.Occluded:
+                occl_limit = max(
+                    self.ais_config.occlusion_max_frames,
+                    self._dynamic_max_time_lost(track))
                 if track.occluded_since is not None and \
-                        self.frame_id - track.occluded_since > self.ais_config.occlusion_max_frames:
+                        self.frame_id - track.occluded_since > occl_limit:
                     track.mark_lost()
-            if self.frame_id - track.end_frame > self.max_time_lost:
+            dynamic_max_time_lost = self._dynamic_max_time_lost(track)
+            if self.frame_id - track.end_frame > dynamic_max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
 
@@ -747,7 +923,9 @@ class BoTSORT(object):
             if track.track_id in output_ids:
                 continue
             obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
-            if self.ais_config.can_output_occluded(track, obs, timestamp, self.frame_id):
+            if self.ais_config.can_output_occluded(track, obs, timestamp, self.frame_id) and \
+                    getattr(track, 'occlusion_state', 0.0) >= getattr(
+                        self.args, 'tgor_output_occlusion_thresh', 0.35):
                 output_stracks.append(track)
                 output_ids.add(track.track_id)
 

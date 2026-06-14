@@ -365,11 +365,14 @@ class AISFusionConfig(object):
             weight = max(weight, 0.7)
         return float(np.clip(weight, 0.0, 1.0))
 
-    def motion_weight(self, track, obs, timestamp, detection_conf=None):
+    def motion_weight(self, track, obs, timestamp, detection_conf=None,
+                      occlusion_state=None):
         return self.motion_weight_details(
-            track, obs, timestamp, detection_conf=detection_conf)['ais_weight']
+            track, obs, timestamp, detection_conf=detection_conf,
+            occlusion_state=occlusion_state)['ais_weight']
 
-    def motion_weight_details(self, track, obs, timestamp, detection_conf=None):
+    def motion_weight_details(self, track, obs, timestamp, detection_conf=None,
+                              occlusion_state=None):
         details = {
             'occlusion_score': 0.0,
             'track_conf': 0.0,
@@ -394,14 +397,17 @@ class AISFusionConfig(object):
         if ais_conf <= 0:
             return details
 
-        state_name = track.state
-        if state_name in (2, 5):  # TrackState.Lost / TrackState.Occluded
-            occlusion_score = 1.0
-        elif getattr(track, 'occluded_since', None) is not None:
-            occlusion_score = 0.8
+        if occlusion_state is not None:
+            occlusion_score = float(np.clip(occlusion_state, 0.0, 1.0))
         else:
-            occlusion_score = max(1.0 - track_conf, 1.0 - detection_conf)
-        occlusion_score = float(np.clip(occlusion_score, 0.0, 1.0))
+            state_name = track.state
+            if state_name in (2, 5):  # TrackState.Lost / TrackState.Occluded
+                occlusion_score = 1.0
+            elif getattr(track, 'occluded_since', None) is not None:
+                occlusion_score = 0.8
+            else:
+                occlusion_score = max(1.0 - track_conf, 1.0 - detection_conf)
+            occlusion_score = float(np.clip(occlusion_score, 0.0, 1.0))
         details['occlusion_score'] = occlusion_score
 
         gate_weight = self.occlusion_aware_weight(

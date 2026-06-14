@@ -242,6 +242,44 @@ def fuse_motion(kf, cost_matrix, tracks, detections, only_position=False, lambda
     return cost_matrix
 
 
+def motion_distance(kf, tracks, detections, only_position=False):
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+    gating_dim = 2 if only_position else 4
+    gating_threshold = kalman_filter.chi2inv95[gating_dim]
+    measurements = np.asarray([det.to_xywh() for det in detections])
+    for row, track in enumerate(tracks):
+        if getattr(track, 'mean', None) is None or getattr(track, 'covariance', None) is None:
+            cost_matrix[row] = 1.0
+            continue
+        gating_distance = kf.gating_distance(
+            track.mean, track.covariance, measurements, only_position, metric='maha')
+        cost_matrix[row] = np.clip(gating_distance / gating_threshold, 0.0, 1.0)
+    return cost_matrix
+
+
+def fuse_occlusion_aware(iou_cost, reid_cost, motion_cost, ais_cost, tracks,
+                         reid_available=True):
+    if iou_cost.size == 0:
+        return iou_cost
+    fused = np.zeros_like(iou_cost)
+    for row, track in enumerate(tracks):
+        s = float(np.clip(getattr(track, 'occlusion_state', 0.0), 0.0, 1.0))
+        w_iou = 0.65 * (1.0 - s) + 0.20
+        w_reid = (0.25 * (1.0 - 0.5 * s)) if reid_available else 0.0
+        w_motion = 0.10 + 0.45 * s
+        w_ais = 0.05 + 0.30 * s
+        total = max(w_iou + w_reid + w_motion + w_ais, 1e-6)
+        fused[row] = (
+            w_iou * iou_cost[row] +
+            w_reid * reid_cost[row] +
+            w_motion * motion_cost[row] +
+            w_ais * ais_cost[row]
+        ) / total
+    return np.clip(fused, 0.0, 1.0)
+
+
 def fuse_iou(cost_matrix, tracks, detections):
     if cost_matrix.size == 0:
         return cost_matrix
