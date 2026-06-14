@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import os.path as osp
 import sys
 import time
@@ -18,7 +19,7 @@ if DEEPSORVF_ROOT not in sys.path:
 
 from tracker.bot_sort import BoTSORT
 from utils.AIS_utils import AISPRO
-from utils.VIS_utils_botsort import VISPRO
+from utils.VIS_utils_botsort_simple import VISPRO
 from utils.FUS_utils import FUSPRO
 from utils.gen_result import gen_result
 from utils.draw import DRAW
@@ -63,7 +64,14 @@ def main(arg):
     DRA = DRAW(im_shape, t)
 
     tracker = BoTSORT(arg, frame_rate=fps)
-    VIS = VISPRO(tracker, arg.anti, arg.anti_rate, t)
+    vispro_params = inspect.signature(VISPRO).parameters
+    if 'tracker' in vispro_params:
+        VIS = VISPRO(
+            arg.anti, arg.anti_rate, t, camera_para=camera_para,
+            im_shape=im_shape, tracker=tracker)
+    else:
+        VIS = VISPRO(arg.anti, arg.anti_rate, t, camera_para, im_shape)
+        VIS.tracker = tracker
 
     name = 'demo'
     show_size = 500
@@ -163,6 +171,30 @@ def make_parser():
     parser.add_argument('--ais-occlusion-max-frames', dest='ais_occlusion_max_frames', type=int, default=60)
     parser.add_argument('--ais-cmc-mode', dest='ais_cmc_mode',
                         choices=['none', 'same', 'inverse'], default='none')
+    parser.add_argument('--ais-debug-enabled', dest='ais_debug_enabled',
+                        action='store_true', default=True)
+    parser.add_argument('--ais-debug-path', dest='ais_debug_path',
+                        default='result/ais_motion_prior_debug.csv')
+    parser.add_argument('--tgor-debug-enabled', dest='tgor_debug_enabled',
+                        action='store_true', default=True)
+    parser.add_argument('--tgor-node-debug-path', dest='tgor_node_debug_path',
+                        default='result/os_tgor_nodes.csv')
+    parser.add_argument('--tgor-edge-debug-path', dest='tgor_edge_debug_path',
+                        default='result/os_tgor_edges.csv')
+    parser.add_argument('--tgor-edge-debug-min-risk', dest='tgor_edge_debug_min_risk',
+                        type=float, default=0.05)
+    parser.add_argument('--tgor-future-steps', dest='tgor_future_steps', type=int, default=5)
+    parser.add_argument('--tgor-neighbor-radius', dest='tgor_neighbor_radius', type=float, default=250.0)
+    parser.add_argument('--tgor-ema', dest='tgor_ema', type=float, default=0.70)
+    parser.add_argument('--tgor-sigma-d', dest='tgor_sigma_d', type=float, default=120.0)
+    parser.add_argument('--tgor-sigma-v', dest='tgor_sigma_v', type=float, default=35.0)
+    parser.add_argument('--tgor-sigma-f', dest='tgor_sigma_f', type=float, default=80.0)
+    parser.add_argument('--tgor-occlusion-mark-thresh', dest='tgor_occlusion_mark_thresh',
+                        type=float, default=0.35)
+    parser.add_argument('--tgor-output-occlusion-thresh', dest='tgor_output_occlusion_thresh',
+                        type=float, default=0.35)
+    parser.add_argument('--tgor-lifecycle-extend', dest='tgor_lifecycle_extend',
+                        type=float, default=1.0)
     parser.set_defaults(ablation=False, mot20=False, oar_polygon=None)
     return parser
 
