@@ -368,6 +368,8 @@ class BoTSORT(object):
         self.tgor_edge_debug_path = getattr(args, 'tgor_edge_debug_path', None)
         self._tgor_node_debug_header_written = False
         self._tgor_edge_debug_header_written = False
+        self.tgor_output_debug_path = getattr(args, 'tgor_output_debug_path', None)
+        self._tgor_output_debug_header_written = False
         self.occlusion_reasoner = OcclusionStateGraphReasoner.from_args(args)
 
     def _detection_conf_by_track(self, tracks, detections):
@@ -510,6 +512,39 @@ class BoTSORT(object):
                 writer.writerow({key: out.get(key) for key in fieldnames})
         self._tgor_edge_debug_header_written = True
 
+    def _write_tgor_output_debug_row(self, track, obs, timestamp, accepted, reason):
+        if not self.tgor_debug_enabled or self.tgor_output_debug_path is None:
+            return
+        debug_dir = os.path.dirname(self.tgor_output_debug_path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        fieldnames = [
+            'frame_id', 'timestamp', 'track_id', 'ais_id', 'track_state',
+            'accepted', 'reason', 'tgor_state', 'ais_reliability',
+            'track_reliability', 'occluded_since',
+        ]
+        write_header = not self._tgor_output_debug_header_written
+        mode = 'w' if write_header else 'a'
+        ais_rel = None if obs is None else self.ais_config.reliability(obs, timestamp)
+        with open(self.tgor_output_debug_path, mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                'frame_id': self.frame_id,
+                'timestamp': timestamp,
+                'track_id': getattr(track, 'track_id', None),
+                'ais_id': getattr(track, 'ais_id', None),
+                'track_state': getattr(track, 'state', None),
+                'accepted': int(bool(accepted)),
+                'reason': reason,
+                'tgor_state': getattr(track, 'occlusion_state', 0.0),
+                'ais_reliability': ais_rel,
+                'track_reliability': getattr(track, 'track_reliability', 0.0),
+                'occluded_since': getattr(track, 'occluded_since', None),
+            })
+        self._tgor_output_debug_header_written = True
+
     def _ais_observations_for_tracks(self, tracks, current_ais_by_id, timestamp):
         obs_by_id = dict(current_ais_by_id)
         for track in tracks:
@@ -562,8 +597,14 @@ class BoTSORT(object):
         if track.ais_id not in ais_by_track_id:
             return False
         obs = ais_by_track_id[track.ais_id]
-        if self.ais_config.reliability(obs, timestamp) < self.ais_config.occlusion_min_score:
-            return False
+        ais_rel = self.ais_config.reliability(obs, timestamp)
+        relaxed_min_rel = getattr(
+            self.args, 'tgor_mark_min_ais_reliability',
+            max(0.0, self.ais_config.occlusion_min_score - 0.15))
+        high_state_thresh = getattr(self.args, 'tgor_output_high_state_thresh', 0.75)
+        if ais_rel < self.ais_config.occlusion_min_score:
+            if not (tgor_state >= high_state_thresh and ais_rel >= relaxed_min_rel):
+                return False
         if not self._point_in_oar(track.mean[:2]):
             return False
         if track.occluded_since is not None:
@@ -591,6 +632,38 @@ class BoTSORT(object):
         s = float(np.clip(getattr(track, 'occlusion_state', 0.0), 0.0, 1.0))
         scale = 1.0 + getattr(self.args, 'tgor_lifecycle_extend', 1.0) * s
         return int(round(self.max_time_lost * scale))
+
+    def _can_output_tgor_occluded(self, track, obs, timestamp):
+        if track is None or track.mean is None:
+            return False, 'invalid_track'
+        if track.state != TrackState.Occluded:
+            return False, 'state_not_occluded'
+
+        s = float(np.clip(getattr(track, 'occlusion_state', 0.0), 0.0, 1.0))
+        if s < getattr(self.args, 'tgor_output_occlusion_thresh', 0.35):
+            return False, 'low_tgor_state'
+
+        w, h = float(track.mean[2]), float(track.mean[3])
+        if w <= 1.0 or h <= 1.0:
+            return False, 'invalid_bbox'
+
+        if obs is None:
+            accepted = s >= getattr(self.args, 'tgor_output_high_state_thresh', 0.75)
+            return accepted, 'high_tgor_no_ais' if accepted else 'no_ais'
+
+        ais_rel = self.ais_config.reliability(obs, timestamp)
+        relaxed_min_rel = getattr(
+            self.args, 'tgor_output_min_ais_reliability',
+            max(0.0, self.ais_config.occlusion_min_score - 0.15))
+
+        if self.ais_config.can_output_occluded(track, obs, timestamp, self.frame_id):
+            return True, 'ais_gate'
+
+        high_state_thresh = getattr(self.args, 'tgor_output_high_state_thresh', 0.75)
+        if s >= high_state_thresh and ais_rel >= relaxed_min_rel:
+            return True, 'tgor_relaxed_ais_gate'
+
+        return False, 'low_ais_reliability'
 
     def _apply_ais_cmc(self, ais_frame, warp):
         mode = self.ais_config.cmc_mode
@@ -917,15 +990,18 @@ class BoTSORT(object):
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks = [track for track in self.tracked_stracks]
         output_ids = set([track.track_id for track in output_stracks])
-        for track in self.lost_stracks:
+        output_candidates = joint_stracks(
+            self.lost_stracks,
+            [track for track in strack_pool if track.state == TrackState.Occluded])
+        for track in output_candidates:
             if track.state != TrackState.Occluded:
                 continue
             if track.track_id in output_ids:
                 continue
             obs = None if track.ais_id is None else ais_by_track_id.get(track.ais_id)
-            if self.ais_config.can_output_occluded(track, obs, timestamp, self.frame_id) and \
-                    getattr(track, 'occlusion_state', 0.0) >= getattr(
-                        self.args, 'tgor_output_occlusion_thresh', 0.35):
+            accepted, reason = self._can_output_tgor_occluded(track, obs, timestamp)
+            self._write_tgor_output_debug_row(track, obs, timestamp, accepted, reason)
+            if accepted:
                 output_stracks.append(track)
                 output_ids.add(track.track_id)
 

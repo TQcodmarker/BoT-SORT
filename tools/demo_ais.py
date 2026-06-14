@@ -181,6 +181,10 @@ def make_parser():
                         default='result/os_tgor_nodes.csv')
     parser.add_argument('--tgor-edge-debug-path', dest='tgor_edge_debug_path',
                         default='result/os_tgor_edges.csv')
+    parser.add_argument('--tgor-output-debug-path', dest='tgor_output_debug_path',
+                        default='result/os_tgor_output.csv')
+    parser.add_argument('--vis-online-debug-path', dest='vis_online_debug_path',
+                        default='result/vis_online_targets.csv')
     parser.add_argument('--tgor-edge-debug-min-risk', dest='tgor_edge_debug_min_risk',
                         type=float, default=0.05)
     parser.add_argument('--tgor-future-steps', dest='tgor_future_steps', type=int, default=5)
@@ -191,7 +195,13 @@ def make_parser():
     parser.add_argument('--tgor-sigma-f', dest='tgor_sigma_f', type=float, default=80.0)
     parser.add_argument('--tgor-occlusion-mark-thresh', dest='tgor_occlusion_mark_thresh',
                         type=float, default=0.35)
+    parser.add_argument('--tgor-mark-min-ais-reliability', dest='tgor_mark_min_ais_reliability',
+                        type=float, default=0.35)
     parser.add_argument('--tgor-output-occlusion-thresh', dest='tgor_output_occlusion_thresh',
+                        type=float, default=0.35)
+    parser.add_argument('--tgor-output-high-state-thresh', dest='tgor_output_high_state_thresh',
+                        type=float, default=0.75)
+    parser.add_argument('--tgor-output-min-ais-reliability', dest='tgor_output_min_ais_reliability',
                         type=float, default=0.35)
     parser.add_argument('--tgor-lifecycle-extend', dest='tgor_lifecycle_extend',
                         type=float, default=1.0)
